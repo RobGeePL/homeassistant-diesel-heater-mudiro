@@ -1,0 +1,61 @@
+{
+  "domain": "diesel_heater",
+  "name": "Diesel Heater",
+  "codeowners": [
+    "@RobGeePL"
+  ],
+  "config_flow": true,
+  "dependencies": [
+    "bluetooth"
+  ],
+  "documentation": "https://github.com/RobGeePL/homeassistant-diesel-heater-mudiro",
+  "integration_type": "device",
+  "issue_tracker": "https://github.com/RobGeePL/homeassistant-diesel-heater-mudiro/issues",
+  "iot_class": "local_polling",
+  "loggers": [
+    "diesel_heater_ble"
+  ],
+  "requirements": [
+    "diesel-heater-ble==0.3.8"
+  ],
+  "icon": "mdi:radiator",
+  "bluetooth": [
+    {
+      "connectable": true,
+      "local_name": "BAC-*"
+    },
+    {
+      "connectable": true,
+      "local_name": "BYD-*"
+    },
+    {
+      "connectable": true,
+      "local_name": "HC-*"
+    },
+    {
+      "connectable": true,
+      "local_name": "Heater[0-9]*"
+    },
+    {
+      "connectable": true,
+      "local_name": "Hcalory*"
+    },
+    {
+      "connectable": true,
+      "local_name": "hcalory*"
+    },
+    {
+      "connectable": true,
+      "local_name": "C1:*:FE:*"
+    },
+    {
+      "connectable": true,
+      "local_name": "boygu*"
+    },
+    {
+      "connectable": true,
+      "local_name": "BOYGU*"
+    }
+  ],
+  "version": "2.1.5-mudiro.1"
+}

@@ -1,0 +1,31 @@
+send_command:
+  name: Send Command
+  description: "Send a protocol-specific raw BLE command for debugging. Use only with the active controller family protocol reference."
+  fields:
+    device_id:
+      name: Device ID
+      description: "MAC address or last 4-5 characters of heater MAC. Specify a target when more than one heater is configured."
+      required: false
+      example: "B864"
+      selector:
+        text:
+    command:
+      name: Command
+      description: "Command number (0-255). Meanings vary by protocol; see the protocol reference before using this diagnostic action."
+      required: true
+      example: 20
+      selector:
+        number:
+          min: 0
+          max: 255
+          mode: box
+    argument:
+      name: Argument
+      description: "Argument value (-128 to 127). Negative values are encoded as two's complement."
+      required: true
+      example: 0
+      selector:
+        number:
+          min: -128
+          max: 127
+          mode: box

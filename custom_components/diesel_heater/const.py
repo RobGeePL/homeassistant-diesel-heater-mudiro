@@ -1,0 +1,388 @@
+"""Constants for the Diesel Heater integration."""
+from typing import Final
+
+# Re-export all protocol constants from the diesel-heater-ble PyPI package.
+# This allows entity files to keep using `from .const import X` unchanged.
+from diesel_heater_ble.const import (  # noqa: F401
+    ABBA_CMD_AUTO,
+    ABBA_CMD_CONST_TEMP,
+    ABBA_CMD_GET_AUTO_CONFIG,
+    ABBA_CMD_GET_TIME,
+    ABBA_CMD_HEAT_OFF,
+    ABBA_CMD_HEAT_ON,
+    ABBA_CMD_HIGH_ALTITUDE,
+    ABBA_CMD_OTHER_MODE,
+    ABBA_CMD_STATUS,
+    ABBA_CMD_TEMP_DOWN,
+    ABBA_CMD_TEMP_UP,
+    ABBA_CMD_VENTILATION,
+    ABBA_ERROR_NAMES,
+    ABBA_STATUS_MAP,
+    CBFF_RUN_STATE_ON,
+    ENCRYPTION_KEY,
+    ERROR_NAMES,
+    ERROR_NONE,
+    MAX_LEVEL,
+    MAX_TEMP_CELSIUS,
+    MIN_LEVEL,
+    MIN_TEMP_CELSIUS,
+    PROTOCOL_HEADER_AA55,
+    PROTOCOL_HEADER_AA66,
+    PROTOCOL_HEADER_AA77,
+    PROTOCOL_HEADER_ABBA,
+    PROTOCOL_HEADER_BAAB,
+    PROTOCOL_HEADER_CBFF,
+    RUNNING_MODE_LEVEL,
+    RUNNING_MODE_MANUAL,
+    RUNNING_MODE_NAMES,
+    RUNNING_MODE_TEMPERATURE,
+    RUNNING_MODE_VENTILATION,
+    RUNNING_STATE_OFF,
+    RUNNING_STATE_ON,
+    RUNNING_STEP_COOLDOWN,
+    RUNNING_STEP_IGNITION,
+    RUNNING_STEP_NAMES,
+    RUNNING_STEP_RUNNING,
+    RUNNING_STEP_SELF_TEST,
+    RUNNING_STEP_STANDBY,
+    RUNNING_STEP_VENTILATION,
+)
+
+# ---------------------------------------------------------------------------
+# Integration-specific constants (Home Assistant only)
+# ---------------------------------------------------------------------------
+
+DOMAIN: Final = "diesel_heater"
+
+# Old domain for migration from previous versions
+OLD_DOMAIN: Final = "vevor_heater"
+
+# BLE Service and Characteristic UUIDs
+# Some heaters use ffe0 instead of fff0
+SERVICE_UUID: Final = "0000ffe0-0000-1000-8000-00805f9b34fb"
+CHARACTERISTIC_UUID: Final = "0000ffe1-0000-1000-8000-00805f9b34fb"
+NOTIFY_UUID: Final = "0000ffe2-0000-1000-8000-00805f9b34fb"
+
+# Alternative UUIDs (fff0 variant)
+SERVICE_UUID_ALT: Final = "0000fff0-0000-1000-8000-00805f9b34fb"
+CHARACTERISTIC_UUID_ALT: Final = "0000fff1-0000-1000-8000-00805f9b34fb"
+NOTIFY_UUID_ALT: Final = "0000fff2-0000-1000-8000-00805f9b34fb"
+
+# ABBA Protocol (HeaterCC heaters)
+# These heaters use service fff0 with characteristics fff1 (notify) and fff2 (write)
+ABBA_SERVICE_UUID: Final = "0000fff0-0000-1000-8000-00805f9b34fb"
+ABBA_NOTIFY_UUID: Final = "0000fff1-0000-1000-8000-00805f9b34fb"
+ABBA_WRITE_UUID: Final = "0000fff2-0000-1000-8000-00805f9b34fb"
+
+# Sunster Neo DZ06 split-FFF0 transport.  Unlike legacy ABBA devices,
+# FFF1 is write-capable and FFF2 is notify-capable.
+DZ06_NEO_SERVICE_UUID: Final = ABBA_SERVICE_UUID
+DZ06_NEO_WRITE_UUID: Final = ABBA_NOTIFY_UUID
+DZ06_NEO_NOTIFY_UUID: Final = ABBA_WRITE_UUID
+# HeatGenie / Boygu controller family
+HEATGENIE_SERVICE_UUID: Final = "0000181a-0000-1000-8000-00805f9b34fb"
+
+# Webasto ThermoConnect Cronus Smart controller family. The APK identifies
+# these characteristics directly; it does not require a service UUID match.
+CRONUS_WRITE_UUID: Final = "2ed964d9-1371-45ee-a84b-1d134d5ce7b7"
+CRONUS_NOTIFY_UUID: Final = "4229d528-33d0-4aa7-9af1-00b03fc128f9"
+
+
+# Hcalory Protocol (MVP1 and MVP2 heaters)
+# MVP1 uses service fff0, MVP2 uses service bd39
+HCALORY_MVP1_SERVICE_UUID: Final = "0000fff0-0000-1000-8000-00805f9b34fb"
+HCALORY_MVP1_WRITE_UUID: Final = "0000fff2-0000-1000-8000-00805f9b34fb"
+HCALORY_MVP1_NOTIFY_UUID: Final = "0000fff1-0000-1000-8000-00805f9b34fb"
+HCALORY_MVP2_SERVICE_UUID: Final = "0000bd39-0000-1000-8000-00805f9b34fb"
+HCALORY_MVP2_WRITE_UUID: Final = "0000bdf7-0000-1000-8000-00805f9b34fb"
+HCALORY_MVP2_NOTIFY_UUID: Final = "0000bdf8-0000-1000-8000-00805f9b34fb"
+
+# Temperature calibration
+CONF_TEMPERATURE_OFFSET: Final = "temperature_offset"
+DEFAULT_TEMPERATURE_OFFSET: Final = 0.0
+MIN_TEMPERATURE_OFFSET: Final = -20.0
+MAX_TEMPERATURE_OFFSET: Final = 20.0
+SENSOR_TEMP_MIN: Final = -128
+SENSOR_TEMP_MAX: Final = 127
+
+# BLE authentication PIN
+CONF_PIN: Final = "pin"
+DEFAULT_PIN: Final = 1234
+MIN_PIN: Final = 0
+MAX_PIN: Final = 9999
+
+# Sunster Neo uses a separate numeric connection password.
+CONF_NEO_PASSWORD: Final = "neo_password"
+DEFAULT_NEO_PASSWORD: Final = 100000000
+MIN_NEO_PASSWORD: Final = 0
+MAX_NEO_PASSWORD: Final = 2147483647
+
+# Climate presets
+CONF_PRESET_AWAY_TEMP: Final = "preset_away_temp"
+CONF_PRESET_COMFORT_TEMP: Final = "preset_comfort_temp"
+DEFAULT_PRESET_AWAY_TEMP: Final = 8
+DEFAULT_PRESET_COMFORT_TEMP: Final = 21
+
+# Auto temperature offset from external sensor
+CONF_EXTERNAL_TEMP_SENSOR: Final = "external_temp_sensor"
+CONF_AUTO_OFFSET_MAX: Final = "auto_offset_max"
+CONF_AUTO_OFFSET_ENABLED: Final = "auto_offset_enabled"
+DEFAULT_AUTO_OFFSET_MAX: Final = 5
+MIN_AUTO_OFFSET_MAX: Final = 1
+MAX_AUTO_OFFSET_MAX: Final = 9
+AUTO_OFFSET_THROTTLE_SECONDS: Final = 60
+AUTO_OFFSET_THRESHOLD: Final = 1.0  # Only adjust if difference >= 1°C
+
+# Force temperature unit (workaround for firmware that mis-reports temp_unit — issue #64)
+# "auto"       → follow the firmware's temp_unit byte (default, preserves current behavior)
+# "celsius"    → treat received temperatures as °C regardless of firmware flag
+# "fahrenheit" → treat received temperatures as °F regardless of firmware flag
+CONF_FORCE_TEMP_UNIT: Final = "force_temp_unit"
+FORCE_TEMP_UNIT_AUTO: Final = "auto"
+FORCE_TEMP_UNIT_CELSIUS: Final = "celsius"
+FORCE_TEMP_UNIT_FAHRENHEIT: Final = "fahrenheit"
+FORCE_TEMP_UNIT_OPTIONS: Final = (
+    FORCE_TEMP_UNIT_AUTO,
+    FORCE_TEMP_UNIT_CELSIUS,
+    FORCE_TEMP_UNIT_FAHRENHEIT,
+)
+DEFAULT_FORCE_TEMP_UNIT: Final = FORCE_TEMP_UNIT_AUTO
+
+# Webasto Cronus does not report the attached heater model. Fuel estimates are
+# therefore available only after the user selects the installed diesel model.
+CONF_CRONUS_HEATER_MODEL: Final = "cronus_heater_model"
+CRONUS_HEATER_MODEL_UNCONFIGURED: Final = "unconfigured"
+DEFAULT_CRONUS_HEATER_MODEL: Final = CRONUS_HEATER_MODEL_UNCONFIGURED
+CRONUS_HEATER_MODEL_OPTIONS: Final = (
+    CRONUS_HEATER_MODEL_UNCONFIGURED,
+    "air_top_evo_40_diesel",
+    "air_top_evo_55_diesel",
+    "thermo_top_evo_4_diesel",
+    "thermo_top_evo_5_diesel",
+)
+# Published diesel consumption rates in L/h. Heating uses the midpoint of the
+# documented modulation range; Eco is an approximate 70% of maximum output;
+# Boost uses Webasto's published boost consumption where available.
+CRONUS_FUEL_PROFILES: Final = {
+    "air_top_evo_40_diesel": {
+        "controller_type": "air",
+        "heating": 0.305,
+        "eco": 0.301,
+        "boost": 0.49,
+    },
+    "air_top_evo_55_diesel": {
+        "controller_type": "air",
+        "heating": 0.395,
+        "eco": 0.427,
+        "boost": 0.67,
+    },
+    "thermo_top_evo_4_diesel": {
+        "controller_type": "water",
+        "heating": 0.4025,
+    },
+    "thermo_top_evo_5_diesel": {
+        "controller_type": "water",
+        "heating": 0.465,
+    },
+}
+
+# Heater temperature offset (sent to heater via cmd 20)
+# Both positive and negative offsets now work via BLE
+# Encoding: arg1 = value % 256, arg2 = (value // 256) % 256
+MIN_HEATER_OFFSET: Final = -9
+MAX_HEATER_OFFSET: Final = 9
+
+# Configuration settings commands (verified by @Xev testing)
+CMD_SET_LANGUAGE: Final = 14
+CMD_SET_TEMP_UNIT: Final = 15
+CMD_SET_TANK_VOLUME: Final = 16  # Index-based: 0=None, 1=5L, 2=10L, etc.
+CMD_SET_PUMP_TYPE: Final = 17
+CMD_SET_ALTITUDE_UNIT: Final = 19  # Was incorrectly 16
+CMD_SET_OFFSET: Final = 20
+CMD_SET_BACKLIGHT: Final = 21
+
+# Language options (byte 26) - verified by @Xev testing
+# Note: Values 1, 5, 6 may not be supported by all heaters
+LANGUAGE_OPTIONS: Final = {
+    0: "English",
+    1: "Chinese",
+    2: "German",
+    3: "Silent",
+    4: "Russian",
+}
+
+# Temperature unit (byte 27)
+TEMP_UNIT_CELSIUS: Final = 0
+TEMP_UNIT_FAHRENHEIT: Final = 1
+
+# Altitude unit (byte 30)
+ALTITUDE_UNIT_METERS: Final = 0
+ALTITUDE_UNIT_FEET: Final = 1
+
+# Tank volume range (byte 28) - index-based, not liters!
+MIN_TANK_VOLUME: Final = 0
+MAX_TANK_VOLUME: Final = 10
+
+# Tank volume options - INDEX-BASED (verified by @Xev testing)
+# The heater stores an index (0-10), not the actual volume
+# Index 0 = None/disabled, Index 1 = 5L, Index 2 = 10L, etc.
+TANK_VOLUME_OPTIONS: Final = {
+    0: "None",
+    1: "5 L",
+    2: "10 L",
+    3: "15 L",
+    4: "20 L",
+    5: "25 L",
+    6: "30 L",
+    7: "35 L",
+    8: "40 L",
+    9: "45 L",
+    10: "50 L",
+}
+
+# Pump type options (byte 29) - verified by @Xev testing
+# Values 20/21 indicate RF433 remote status (not pump type)
+PUMP_TYPE_OPTIONS: Final = {
+    0: "16µl",
+    1: "22µl",
+    2: "28µl",
+    3: "32µl",
+}
+
+# Backlight brightness options (discrete values matching Vevor app)
+# Off, 1-10 fine control, then 20-100 in steps of 10
+BACKLIGHT_OPTIONS: Final = {
+    0: "Off",
+    1: "1",
+    2: "2",
+    3: "3",
+    4: "4",
+    5: "5",
+    6: "6",
+    7: "7",
+    8: "8",
+    9: "9",
+    10: "10",
+    20: "20",
+    30: "30",
+    40: "40",
+    50: "50",
+    60: "60",
+    70: "70",
+    80: "80",
+    90: "90",
+    100: "100",
+}
+
+# High Altitude Mode options (Hcalory MVP2 - @Xev, issue #34)
+# Hcalory has 3 altitude modes instead of binary on/off
+HIGH_ALTITUDE_MODE_OPTIONS: Final = {
+    0: "Disabled",
+    1: "Mode 1",
+    2: "Mode 2",
+}
+
+# Update interval
+# Reduced from 30s to 15s based on @Xev's analysis (issue #34) showing
+# Android app polls more frequently. For MVP2, heater broadcasts status
+# every ~2s automatically, so this is mainly timeout/fallback interval.
+UPDATE_INTERVAL: Final = 15  # seconds (default for most protocols)
+
+# Hcalory-specific update interval (@Xev analysis: needs faster polling)
+# Android app polls ~1.5-2s, heater broadcasts ~2s. 5s provides better
+# stability than 15s while not overloading the BLE connection.
+UPDATE_INTERVAL_HCALORY: Final = 5  # seconds (Hcalory MVP1/MVP2 only)
+
+# Fuel consumption tracking (minimal - consumption only)
+# Consumption rates in L/h based on VEVOR specs (0.16-0.52 L/h range)
+FUEL_CONSUMPTION_TABLE: Final = {
+    1: 0.16,  # Minimum consumption
+    2: 0.20,
+    3: 0.24,
+    4: 0.28,
+    5: 0.32,
+    6: 0.36,
+    7: 0.40,
+    8: 0.44,
+    9: 0.48,
+    10: 0.52,  # Maximum consumption
+}
+
+# Data persistence keys
+STORAGE_KEY_TOTAL_FUEL: Final = "total_fuel_consumed"
+STORAGE_KEY_DAILY_FUEL: Final = "daily_fuel_consumed"
+STORAGE_KEY_DAILY_DATE: Final = "daily_fuel_date"
+STORAGE_KEY_DAILY_HISTORY: Final = "daily_fuel_history"
+
+# Runtime tracking persistence keys
+STORAGE_KEY_TOTAL_RUNTIME: Final = "total_runtime_seconds"
+STORAGE_KEY_DAILY_RUNTIME: Final = "daily_runtime_seconds"
+STORAGE_KEY_DAILY_RUNTIME_DATE: Final = "daily_runtime_date"
+STORAGE_KEY_DAILY_RUNTIME_HISTORY: Final = "daily_runtime_history"
+
+# Fuel level tracking persistence keys
+STORAGE_KEY_FUEL_SINCE_RESET: Final = "fuel_consumed_since_reset"
+STORAGE_KEY_TANK_CAPACITY: Final = "tank_capacity_liters"
+STORAGE_KEY_LAST_REFUELED: Final = "last_refueled"
+
+# Auto offset persistence key
+STORAGE_KEY_AUTO_OFFSET_ENABLED: Final = "auto_offset_enabled"
+
+# Max-power soot burn-off (automatic enable, in-run, and shutdown)
+CONF_BURNOFF_ENABLED: Final = "automatic_burnoff"
+CONF_BURNOFF_DURATION: Final = "burnoff_duration"
+CONF_BURNOFF_AFTER_CYCLES: Final = "burnoff_after_cycles"
+CONF_BURNOFF_AFTER_HOURS: Final = "burnoff_after_hours"
+DEFAULT_BURNOFF_ENABLED: Final = False
+DEFAULT_BURNOFF_DURATION: Final = 10  # minutes
+DEFAULT_BURNOFF_AFTER_CYCLES: Final = 0  # 0 = in-run by cycles disabled
+DEFAULT_BURNOFF_AFTER_HOURS: Final = 0  # 0 = in-run by hours disabled
+MIN_BURNOFF_DURATION: Final = 1
+MAX_BURNOFF_DURATION: Final = 30
+MIN_BURNOFF_AFTER_CYCLES: Final = 0
+MAX_BURNOFF_AFTER_CYCLES: Final = 20
+MIN_BURNOFF_AFTER_HOURS: Final = 0
+MAX_BURNOFF_AFTER_HOURS: Final = 24
+# Abort count after which threshold in-run is skipped. 1 means the first early
+# ECU abort still retries (pending); a second abort cannot loop Level 10 forever.
+MAX_BURNOFF_IN_RUN_ABORTS: Final = 1
+# Fraction of duration still remaining at which an ECU abort counts as a clean.
+# 0.2 = last 20%: Level 10 often trips Auto Start/Stop cooldown near the end.
+BURNOFF_NEAR_COMPLETE_REMAINING_RATIO: Final = 0.2
+STORAGE_KEY_BURNOFF: Final = "burnoff"
+STORAGE_KEY_BURNOFF_ACCUMULATOR: Final = "burnoff_accumulator"
+
+# History settings
+MAX_HISTORY_DAYS: Final = 30  # Keep last 30 days of daily consumption
+
+# Protocol mode names for diagnostic sensor
+# Mode 0 = unknown (before first successful data read)
+# Modes 1-7 are detected from BLE response headers
+PROTOCOL_MODE_NAMES: Final = {
+    0: "Unknown",
+    1: "AA55 (Vevor)",
+    2: "AA55 Encrypted",
+    3: "AA66 (BYD)",
+    4: "AA66 Encrypted",
+    5: "ABBA (HeaterCC)",
+    6: "CBFF (Sunster)",
+    7: "Hcalory",
+    8: "HeatGenie",
+    9: "Webasto Cronus",
+}
+
+# Sunster Neo 1.0.9 getWindDeviceErrorStr(), after receive() normalization.
+# These codes are specific to DZ06 Neo and must not reuse the AA55 table.
+NEO_ERROR_NAMES: Final = {
+    0: "No fault",
+    1: "Undervoltage",
+    2: "Overvoltage",
+    3: "Glow plug fault",
+    4: "Fuel pump fault",
+    5: "Overheating",
+    6: "Fan motor fault",
+    7: "Connection fault",
+    8: "Flame extinguished",
+    9: "Case temperature sensor fault",
+    10: "Ignition failure",
+}

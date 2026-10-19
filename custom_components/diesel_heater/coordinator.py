@@ -1,0 +1,3556 @@
+"""Coordinator for Vevor Diesel Heater."""
+from __future__ import annotations
+
+import asyncio
+import logging
+import random
+import time
+from datetime import datetime, timedelta
+from typing import Any
+
+from bleak import BleakClient
+from bleak.exc import BleakError
+from bleak_retry_connector import establish_connection
+
+from homeassistant.components import bluetooth
+from homeassistant.components.recorder import get_instance
+from homeassistant.components.recorder.statistics import (
+    async_add_external_statistics,
+    StatisticData,
+    StatisticMetaData,
+    StatisticMeanType,
+)
+from homeassistant.const import UnitOfTime, UnitOfVolume
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.storage import Store
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.util import dt as dt_util
+
+from homeassistant.helpers.event import async_track_state_change_event
+
+from .burnoff import BurnoffController, BurnoffPhase
+from .const import (
+    ABBA_NOTIFY_UUID,
+    ABBA_SERVICE_UUID,
+    ABBA_WRITE_UUID,
+    AUTO_OFFSET_THRESHOLD,
+    AUTO_OFFSET_THROTTLE_SECONDS,
+    CHARACTERISTIC_UUID,
+    CHARACTERISTIC_UUID_ALT,
+    CONF_AUTO_OFFSET_ENABLED,
+    CONF_AUTO_OFFSET_MAX,
+    CONF_BURNOFF_AFTER_CYCLES,
+    CONF_BURNOFF_AFTER_HOURS,
+    CONF_BURNOFF_DURATION,
+    CONF_BURNOFF_ENABLED,
+    CONF_EXTERNAL_TEMP_SENSOR,
+    CONF_FORCE_TEMP_UNIT,
+    CONF_CRONUS_HEATER_MODEL,
+    CRONUS_FUEL_PROFILES,
+    CONF_NEO_PASSWORD,
+    CONF_PIN,
+    CONF_TEMPERATURE_OFFSET,
+    CRONUS_NOTIFY_UUID,
+    CRONUS_WRITE_UUID,
+    DEFAULT_AUTO_OFFSET_MAX,
+    DEFAULT_BURNOFF_AFTER_CYCLES,
+    DEFAULT_BURNOFF_AFTER_HOURS,
+    DEFAULT_BURNOFF_DURATION,
+    DEFAULT_BURNOFF_ENABLED,
+    DEFAULT_FORCE_TEMP_UNIT,
+    DEFAULT_NEO_PASSWORD,
+    DEFAULT_PIN,
+    DEFAULT_TEMPERATURE_OFFSET,
+    FORCE_TEMP_UNIT_CELSIUS,
+    FORCE_TEMP_UNIT_FAHRENHEIT,
+    DOMAIN,
+    FUEL_CONSUMPTION_TABLE,
+    HEATGENIE_SERVICE_UUID,
+    HCALORY_MVP2_NOTIFY_UUID,
+    HCALORY_MVP2_SERVICE_UUID,
+    HCALORY_MVP2_WRITE_UUID,
+    DZ06_NEO_NOTIFY_UUID,
+    DZ06_NEO_WRITE_UUID,
+    MAX_BURNOFF_AFTER_CYCLES,
+    MAX_BURNOFF_AFTER_HOURS,
+    MAX_BURNOFF_DURATION,
+    MAX_HEATER_OFFSET,
+    MAX_LEVEL,
+    MAX_HISTORY_DAYS,
+    MIN_BURNOFF_AFTER_CYCLES,
+    MIN_BURNOFF_AFTER_HOURS,
+    MIN_BURNOFF_DURATION,
+    MIN_HEATER_OFFSET,
+    PROTOCOL_HEADER_ABBA,
+    PROTOCOL_HEADER_CBFF,
+    PROTOCOL_HEADER_AA77,
+    RUNNING_MODE_LEVEL,
+    RUNNING_MODE_TEMPERATURE,
+    RUNNING_STATE_OFF,
+    RUNNING_STATE_ON,
+    RUNNING_STEP_COOLDOWN,
+    RUNNING_STEP_RUNNING,
+    RUNNING_STEP_STANDBY,
+    SENSOR_TEMP_MAX,
+    SENSOR_TEMP_MIN,
+    SERVICE_UUID,
+    SERVICE_UUID_ALT,
+    STORAGE_KEY_AUTO_OFFSET_ENABLED,
+    STORAGE_KEY_BURNOFF,
+    STORAGE_KEY_BURNOFF_ACCUMULATOR,
+    STORAGE_KEY_FUEL_SINCE_RESET,
+    STORAGE_KEY_LAST_REFUELED,
+    STORAGE_KEY_TANK_CAPACITY,
+    STORAGE_KEY_DAILY_DATE,
+    STORAGE_KEY_DAILY_FUEL,
+    STORAGE_KEY_DAILY_HISTORY,
+    STORAGE_KEY_DAILY_RUNTIME,
+    STORAGE_KEY_DAILY_RUNTIME_DATE,
+    STORAGE_KEY_DAILY_RUNTIME_HISTORY,
+    STORAGE_KEY_TOTAL_FUEL,
+    STORAGE_KEY_TOTAL_RUNTIME,
+    TEMP_UNIT_CELSIUS,
+    TEMP_UNIT_FAHRENHEIT,
+    UPDATE_INTERVAL,
+    UPDATE_INTERVAL_HCALORY,
+)
+from diesel_heater_ble import (
+    HeaterProtocol,
+    ProtocolAA55,
+    ProtocolAA55Encrypted,
+    ProtocolAA66,
+    ProtocolAA66Encrypted,
+    ProtocolABBA,
+    ProtocolCronus,
+    ProtocolHeatGenie,
+    ProtocolCBFF,
+    ProtocolHcalory,
+    _decrypt_data,
+    _u8_to_number,
+)
+
+_LOGGER = logging.getLogger(__name__)
+
+
+class _HeaterLoggerAdapter(logging.LoggerAdapter):
+    """Logger adapter that prefixes messages with heater ID."""
+
+    def process(self, msg, kwargs):
+        return f"[{self.extra['heater_id']}] {msg}", kwargs
+
+
+class VevorHeaterCoordinator(DataUpdateCoordinator):
+    """Vevor Heater coordinator."""
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        ble_device: bluetooth.BleakDevice,
+        config_entry: Any,
+    ) -> None:
+        """Initialize the coordinator."""
+        super().__init__(
+            hass,
+            _LOGGER,
+            name=DOMAIN,
+            update_interval=timedelta(seconds=UPDATE_INTERVAL),
+        )
+
+        self.address = ble_device.address
+        self._ble_device = ble_device
+        self.config_entry = config_entry
+        # Per-instance logger with heater ID prefix for multi-heater support
+        self._logger = _HeaterLoggerAdapter(
+            _LOGGER, {"heater_id": ble_device.address[-5:]}
+        )
+        self._client: BleakClient | None = None
+        self._characteristic = None
+        self._active_char_uuid: str | None = None  # Track which UUID variant is active
+        self._notification_data: bytearray | None = None
+        # Get passkey from config, default to 1234 (factory default for most heaters)
+        self._passkey = config_entry.data.get(CONF_PIN, DEFAULT_PIN)
+        self._neo_password = config_entry.data.get(CONF_NEO_PASSWORD, DEFAULT_NEO_PASSWORD)
+        self._protocol_mode = 0  # Will be detected from response (1-6)
+        self._protocol: HeaterProtocol | None = None  # Active protocol handler
+        force_temp_unit = config_entry.data.get(
+            CONF_FORCE_TEMP_UNIT, DEFAULT_FORCE_TEMP_UNIT
+        )
+        aa66_encrypted = ProtocolAA66Encrypted()
+        if force_temp_unit == FORCE_TEMP_UNIT_CELSIUS:
+            aa66_encrypted.set_temperature_unit_override(TEMP_UNIT_CELSIUS)
+        elif force_temp_unit == FORCE_TEMP_UNIT_FAHRENHEIT:
+            aa66_encrypted.set_temperature_unit_override(TEMP_UNIT_FAHRENHEIT)
+
+        cbff = ProtocolCBFF()
+        # CBFF encryption uses BLE MAC (without colons, uppercased) as key2
+        device_sn = ble_device.address.replace(":", "").replace("-", "").upper()
+        cbff.set_device_sn(device_sn)
+
+        self._protocols: dict[int, HeaterProtocol] = {
+            1: ProtocolAA55(),
+            2: ProtocolAA55Encrypted(),
+            3: ProtocolAA66(),
+            4: aa66_encrypted,
+            5: ProtocolABBA(),
+            6: cbff,
+            8: ProtocolHeatGenie(),
+            7: ProtocolHcalory(),
+            9: ProtocolCronus(),
+        }
+        self._is_abba_device = False  # True if using ABBA/HeaterCC protocol
+        self._abba_write_char = None  # ABBA devices use separate write characteristic
+        self._is_heatgenie_device = False
+        self._heatgenie_write_char = None
+        self._is_cronus_device = False
+        self._cronus_write_char = None
+        self._cronus_records: dict[str, bytes] = {}
+        self._cronus_pending_id: int | None = None
+        self._cronus_pending_write_id: int | None = None
+        self._cronus_write_succeeded = False
+        self._cronus_pending_data = bytearray()
+        self._cronus_expected_length = 0
+        self._cronus_response_event = asyncio.Event()
+        self._cronus_write_event = asyncio.Event()
+        self._cronus_transaction_lock = asyncio.Lock()
+        self._v21_handshake_sent = False  # Track if Sunster V2.1 handshake was sent
+        self._is_hcalory_device = False  # True if using Hcalory MVP1/MVP2 protocol
+        self._hcalory_write_char = None  # Hcalory devices use separate write characteristic
+        # Hcalory returns set_value=None when heater is OFF (@Xev's discovery, issue #34)
+        # Remember last known values to restore when heater turns off
+        self._hcalory_last_set_temp: int | None = None
+        self._hcalory_last_set_level: int | None = None
+        self._connection_attempts = 0
+        self._last_connection_attempt = 0.0
+        self._consecutive_failures = 0  # Track consecutive update failures
+        self._time_synced_this_session = False  # Track if time was synced after connection
+        self._max_stale_cycles = 3  # Keep last values for this many failed cycles
+        self._last_valid_data: dict[str, Any] = {}  # Cache of last valid sensor readings
+        self._heater_uses_fahrenheit: bool = False  # Detected from heater response
+        self._force_temp_unit: str = force_temp_unit
+
+        # Current state
+        self.data: dict[str, Any] = {
+            "running_state": None,
+            "error_code": None,
+            "running_step": None,
+            "altitude": None,
+            "running_mode": None,
+            "set_level": None,
+            "set_temp": None,
+            "supply_voltage": None,
+            "case_temperature": None,
+            "cab_temperature": None,
+            "cab_temperature_raw": None,  # Raw temperature before any offset
+            "heater_offset": 0,  # Current offset sent to heater (cmd 20)
+            "connected": False,
+            "auto_start_stop": None,  # Automatic Start/Stop flag (byte 31)
+            "auto_offset_enabled": False,  # Auto offset adjustment enabled
+            # Configuration settings (bytes 26-30)
+            "language": None,  # byte 26: Voice notification language
+            "temp_unit": None,  # byte 27: 0=Celsius, 1=Fahrenheit
+            "tank_volume": None,  # byte 28: Tank volume in liters
+            "pump_type": None,  # byte 29: Oil pump type
+            "altitude_unit": None,  # byte 30: 0=Meters, 1=Feet
+            "rf433_enabled": None,  # byte 29 value 20/21 indicates RF433 status
+            # Fuel consumption tracking
+            "hourly_fuel_consumption": None,
+            "daily_fuel_consumed": 0.0,
+            "total_fuel_consumed": 0.0,
+            # Runtime tracking
+            "daily_runtime_hours": 0.0,
+            "total_runtime_hours": 0.0,
+            # Fuel level tracking
+            "tank_capacity": None,  # User-defined tank capacity in liters (1-100)
+            "fuel_remaining": None,
+            "fuel_consumed_since_reset": 0.0,
+            "last_refueled": None,  # ISO timestamp of last refuel reset
+            "neo_raw_state": None,  # Set only after a confirmed DZ06 Bluetooth status frame
+            "neo_run_type": None,
+            "neo_min_target": None,
+            "neo_max_target": None,
+        }
+
+        # Fuel consumption tracking (minimal)
+        self._store = Store(hass, 1, f"{DOMAIN}_{ble_device.address}")
+        self._last_update_time: float = time.time()
+        self._total_fuel_consumed: float = 0.0
+        self._daily_fuel_consumed: float = 0.0
+        self._daily_fuel_history: dict[str, float] = {}  # date -> liters consumed
+        self._fuel_consumed_since_reset: float = 0.0  # Fuel since last refuel reset
+        self._last_save_time: float = time.time()
+        self._last_reset_date: str = datetime.now().date().isoformat()
+
+        # Runtime tracking
+        self._total_runtime_seconds: float = 0.0
+        self._daily_runtime_seconds: float = 0.0
+        self._daily_runtime_history: dict[str, float] = {}  # date -> hours running
+        self._last_runtime_reset_date: str = datetime.now().date().isoformat()
+
+        # Auto temperature offset from external sensor
+        self._auto_offset_unsub: callable | None = None
+        self._last_auto_offset_time: float = 0.0
+        self._current_heater_offset: int = 0  # Current offset sent to heater via cmd 12
+
+        # Max-power soot burn-off. Live cycle, soot accumulator, and entity
+        # fields live on the controller; this coordinator stays a facade for
+        # entities and BLE.
+        self._burnoff = BurnoffController(self)
+
+    @property
+    def protocol_mode(self) -> int:
+        """Return the detected BLE protocol mode (0=unknown, 1-7=detected)."""
+        return self._protocol_mode
+
+    @property
+    def cronus_fuel_profile(self) -> dict[str, object] | None:
+        """Return the selected profile when it matches the connected Cronus type."""
+        if self._protocol_mode != 9:
+            return None
+        profile = CRONUS_FUEL_PROFILES.get(
+            self.config_entry.data.get(CONF_CRONUS_HEATER_MODEL)
+        )
+        if profile is None:
+            return None
+        if profile["controller_type"] != self.data.get("cronus_controller_type"):
+            return None
+        return profile
+
+    @property
+    def has_cronus_fuel_estimate(self) -> bool:
+        """Return whether a matching Cronus fuel-estimate profile is configured."""
+        return self.cronus_fuel_profile is not None
+
+    @property
+    def protocol_name(self) -> str:
+        """Return human-readable protocol name with variant details."""
+        from .const import PROTOCOL_MODE_NAMES
+
+        base_name = PROTOCOL_MODE_NAMES.get(self._protocol_mode, "Unknown")
+
+        # For Hcalory, add MVP1/MVP2 variant
+        if self._protocol_mode == 7 and self._protocol is not None:
+            if hasattr(self._protocol, '_is_mvp2'):
+                variant = "MVP2" if self._protocol._is_mvp2 else "MVP1"
+                return f"Hcalory {variant}"
+
+        # For CBFF, indicate V2.1 encrypted mode if active
+        if self._protocol_mode == 6 and self._protocol is not None:
+            if hasattr(self._protocol, 'v21_mode') and self._protocol.v21_mode:
+                return "CBFF V2.1 (Encrypted)"
+
+        return base_name
+
+    @property
+    def is_cronus_device(self) -> bool:
+        """Return whether the advertised name matches ThermoConnect Cronus."""
+        return "CRONUS" in (self._ble_device.name or "")
+
+    @property
+    def is_dz06_neo(self) -> bool:
+        """Return whether the split-FFF0 Sunster Neo transport is active."""
+        return bool(
+            self._is_abba_device
+            and self._characteristic
+            and self._abba_write_char
+            and self._characteristic.uuid.lower() == DZ06_NEO_NOTIFY_UUID.lower()
+            and self._abba_write_char.uuid.lower() == DZ06_NEO_WRITE_UUID.lower()
+            and "notify" in self._characteristic.properties
+            and (
+                "write" in self._abba_write_char.properties
+                or "write-without-response" in self._abba_write_char.properties
+            )
+        )
+
+    @property
+    def is_heatgenie_device(self) -> bool:
+        """Return whether the BLE name matches a HeatGenie app identity."""
+        name = (self._ble_device.name or "").upper()
+        if "BOYGU" in name:
+            return True
+        parts = name.split(":")
+        return (
+            len(parts) == 6
+            and parts[0] == "C1"
+            and parts[4] == "FE"
+            and all(len(part) == 2 and all(char in "0123456789ABCDEF" for char in part) for part in parts)
+        )
+
+    async def async_load_data(self) -> None:
+        """Load persistent fuel consumption and runtime data."""
+        try:
+            data = await self._store.async_load()
+            if data:
+                # Load fuel consumption data
+                self._total_fuel_consumed = data.get(STORAGE_KEY_TOTAL_FUEL, 0.0)
+                self._daily_fuel_consumed = data.get(STORAGE_KEY_DAILY_FUEL, 0.0)
+                self._daily_fuel_history = data.get(STORAGE_KEY_DAILY_HISTORY, {})
+
+                # Load runtime tracking data
+                self._total_runtime_seconds = data.get(STORAGE_KEY_TOTAL_RUNTIME, 0.0)
+                self._daily_runtime_seconds = data.get(STORAGE_KEY_DAILY_RUNTIME, 0.0)
+                self._daily_runtime_history = data.get(STORAGE_KEY_DAILY_RUNTIME_HISTORY, {})
+
+                # Clean old history entries (keep only last MAX_HISTORY_DAYS)
+                self._clean_old_history()
+                self._clean_old_runtime_history()
+
+                # Check if we need to reset daily fuel counter
+                saved_date = data.get(STORAGE_KEY_DAILY_DATE)
+                if saved_date:
+                    today = datetime.now().date().isoformat()
+                    if saved_date != today:
+                        self._logger.info("New day detected at startup, resetting daily fuel counter")
+                        # Save yesterday's consumption to history before resetting
+                        if self._daily_fuel_consumed > 0:
+                            self._daily_fuel_history[saved_date] = round(self._daily_fuel_consumed, 2)
+                            self._logger.info("Saved %s: %.2fL to history", saved_date, self._daily_fuel_consumed)
+                        self._daily_fuel_consumed = 0.0
+                        self._last_reset_date = today
+                    else:
+                        self._last_reset_date = saved_date
+                else:
+                    # No saved date, use today
+                    self._last_reset_date = datetime.now().date().isoformat()
+
+                # Check if we need to reset daily runtime counter
+                saved_runtime_date = data.get(STORAGE_KEY_DAILY_RUNTIME_DATE)
+                if saved_runtime_date:
+                    today = datetime.now().date().isoformat()
+                    if saved_runtime_date != today:
+                        self._logger.info("New day detected at startup, resetting daily runtime counter")
+                        # Save yesterday's runtime to history before resetting
+                        if self._daily_runtime_seconds > 0:
+                            hours = round(self._daily_runtime_seconds / 3600.0, 2)
+                            self._daily_runtime_history[saved_runtime_date] = hours
+                            self._logger.info("Saved %s: %.2fh to runtime history", saved_runtime_date, hours)
+                        self._daily_runtime_seconds = 0.0
+                        self._last_runtime_reset_date = today
+                    else:
+                        self._last_runtime_reset_date = saved_runtime_date
+                else:
+                    # No saved date, use today
+                    self._last_runtime_reset_date = datetime.now().date().isoformat()
+
+                # Update data dictionary with loaded values
+                self.data["total_fuel_consumed"] = round(self._total_fuel_consumed, 2)
+                self.data["daily_fuel_consumed"] = round(self._daily_fuel_consumed, 2)
+                self.data["daily_fuel_history"] = self._daily_fuel_history
+                self.data["daily_runtime_hours"] = round(self._daily_runtime_seconds / 3600.0, 2)
+                self.data["total_runtime_hours"] = round(self._total_runtime_seconds / 3600.0, 2)
+                self.data["daily_runtime_history"] = self._daily_runtime_history
+
+                self._logger.debug(
+                    "Loaded fuel data: total=%.2fL, daily=%.2fL, history entries=%d",
+                    self._total_fuel_consumed,
+                    self._daily_fuel_consumed,
+                    len(self._daily_fuel_history)
+                )
+                self._logger.debug(
+                    "Loaded runtime data: total=%.2fh, daily=%.2fh, history entries=%d",
+                    self._total_runtime_seconds / 3600.0,
+                    self._daily_runtime_seconds / 3600.0,
+                    len(self._daily_runtime_history)
+                )
+
+                # Load fuel level tracking
+                self._fuel_consumed_since_reset = data.get(STORAGE_KEY_FUEL_SINCE_RESET, 0.0)
+                self.data["fuel_consumed_since_reset"] = round(self._fuel_consumed_since_reset, 2)
+                tank_capacity = data.get(STORAGE_KEY_TANK_CAPACITY)
+                if tank_capacity is not None:
+                    self.data["tank_capacity"] = tank_capacity
+                last_refueled = data.get(STORAGE_KEY_LAST_REFUELED)
+                if last_refueled is not None:
+                    self.data["last_refueled"] = last_refueled
+                self._update_fuel_remaining()
+                self._logger.debug(
+                    "Loaded fuel level data: consumed_since_reset=%.2fL, tank_capacity=%s, last_refueled=%s",
+                    self._fuel_consumed_since_reset, self.data.get("tank_capacity"), self.data.get("last_refueled")
+                )
+
+                # Load auto offset enabled state
+                auto_offset_enabled = data.get(STORAGE_KEY_AUTO_OFFSET_ENABLED, False)
+                self.data["auto_offset_enabled"] = auto_offset_enabled
+                self._logger.debug("Loaded auto_offset_enabled: %s", auto_offset_enabled)
+
+                # Resume in-progress max-power burn-off after HA restart
+                await self._burnoff.load_state(data.get(STORAGE_KEY_BURNOFF))
+                self._burnoff.load_accumulator(
+                    data.get(STORAGE_KEY_BURNOFF_ACCUMULATOR)
+                )
+
+                # Import existing history into statistics for native graphing
+                await self._import_all_history_statistics()
+                await self._import_all_runtime_history_statistics()
+        except Exception as err:
+            self._logger.warning("Could not load data: %s", err)
+
+        # Set up external temperature sensor listener for auto offset
+        await self._setup_external_temp_listener()
+
+    async def _setup_external_temp_listener(self) -> None:
+        """Set up listener for external temperature sensor state changes."""
+        # Clean up any existing listener
+        if self._auto_offset_unsub:
+            self._auto_offset_unsub()
+            self._auto_offset_unsub = None
+
+        # Get external sensor entity_id from config
+        external_sensor = self.config_entry.data.get(CONF_EXTERNAL_TEMP_SENSOR, "")
+        if not external_sensor:
+            self._logger.debug("No external temperature sensor configured")
+            return
+
+        self._logger.info(
+            "Setting up auto offset from external sensor: %s (max offset: %d°C)",
+            external_sensor,
+            self.config_entry.data.get(CONF_AUTO_OFFSET_MAX, DEFAULT_AUTO_OFFSET_MAX)
+        )
+
+        # Subscribe to state changes
+        self._auto_offset_unsub = async_track_state_change_event(
+            self.hass,
+            [external_sensor],
+            self._async_external_temp_changed
+        )
+
+        # Calculate initial offset
+        await self._async_calculate_auto_offset()
+
+    def _handle_cronus_notification(self, data: bytearray) -> None:
+        """Collect one ThermoConnect record reply or write acknowledgement."""
+        self._notification_data = data
+        protocol = self._protocols[9]
+        assert isinstance(protocol, ProtocolCronus)
+        ack = protocol.parse_write_ack(data)
+        if ack is not None:
+            ack_record_id, succeeded = ack
+            if ack_record_id == self._cronus_pending_write_id:
+                self._cronus_write_succeeded = succeeded
+                self._cronus_write_event.set()
+            return
+
+        frame = protocol.parse_frame(data)
+        if frame is None:
+            return
+        record_id, fragment, total_length, complete = frame
+        if record_id != self._cronus_pending_id:
+            return
+        if total_length >= 0:
+            self._cronus_pending_data = bytearray(fragment)
+            self._cronus_expected_length = total_length
+        else:
+            self._cronus_pending_data.extend(fragment)
+        if complete or (
+            self._cronus_expected_length
+            and len(self._cronus_pending_data) >= self._cronus_expected_length
+        ):
+            self._cronus_response_event.set()
+
+    async def _async_read_cronus_record(self, name: str) -> bool:
+        """Read one documented ThermoConnect record into the local cache."""
+        protocol = self._protocols[9]
+        assert isinstance(protocol, ProtocolCronus)
+        record_id = protocol.RECORD_IDS[name]
+        self._cronus_pending_id = record_id
+        self._cronus_pending_data = bytearray()
+        self._cronus_expected_length = 0
+        self._cronus_response_event.clear()
+        await self._write_gatt(protocol.build_read_record(record_id))
+        try:
+            await asyncio.wait_for(self._cronus_response_event.wait(), timeout=3)
+        except TimeoutError:
+            self._logger.debug("Cronus record %s (0x%02X) did not reply", name, record_id)
+            return False
+        self._cronus_records[name] = bytes(self._cronus_pending_data)
+        return True
+
+    async def _async_write_cronus_record(self, name: str, payload: bytes) -> bool:
+        """Write one documented ThermoConnect record and wait for its matching ack."""
+        protocol = self._protocols[9]
+        assert isinstance(protocol, ProtocolCronus)
+        record_id = protocol.RECORD_IDS[name]
+        async with self._cronus_transaction_lock:
+            self._cronus_pending_write_id = record_id
+            self._cronus_write_succeeded = False
+            self._cronus_write_event.clear()
+            try:
+                await self._write_gatt(protocol.build_write_record(record_id, payload))
+                await asyncio.wait_for(self._cronus_write_event.wait(), timeout=3)
+            except TimeoutError:
+                self._logger.debug("Cronus write %s did not acknowledge", name)
+                return False
+            finally:
+                self._cronus_pending_write_id = None
+            if not self._cronus_write_succeeded:
+                self._logger.warning("Cronus write %s was rejected by the controller", name)
+                return False
+        return True
+
+    async def _async_update_cronus_data(self) -> dict[str, Any]:
+        """Poll one fresh, internally consistent ThermoConnect record snapshot."""
+        cronus_data_keys = {
+            "connected", "cronus_controller_type", "cronus_mode", "cronus_state",
+            "cronus_state_real", "cronus_interlock", "cronus_duration",
+            "cronus_max_duration", "cronus_nonstop", "cronus_external_temperature",
+            "cronus_coolant_temperature", "cronus_air_pressure", "running_state",
+            "running_step", "running_mode", "set_level", "set_temp",
+            "supply_voltage", "cab_temperature",
+        }
+        async with self._cronus_transaction_lock:
+            self._cronus_records = {}
+            for key in cronus_data_keys:
+                self.data.pop(key, None)
+            if not await self._async_read_cronus_record("h1_available"):
+                raise UpdateFailed("Cronus controller type did not reply")
+
+            is_water = self._cronus_records["h1_available"] == bytes((1,))
+            prefix = "water" if is_water else "air"
+            required_records = (
+                f"{prefix}_state", f"{prefix}_state_real", f"{prefix}_mode",
+            )
+            for name in required_records:
+                if not await self._async_read_cronus_record(name):
+                    raise UpdateFailed(f"Cronus required record {name} did not reply")
+
+            optional_records = [
+                f"{prefix}_interlock", f"{prefix}_duration", f"{prefix}_nonstop",
+                f"{prefix}_max_duration", "temp_int", "temp_ext", "temp_coolant", "voltage",
+            ]
+            if not is_water:
+                optional_records.extend((
+                    "air_level", "air_setpoint", "air_setpoint_boost",
+                    "air_setpoint_eco", "air_pressure",
+                ))
+            for name in optional_records:
+                await self._async_read_cronus_record(name)
+
+            protocol = self._protocols[9]
+            assert isinstance(protocol, ProtocolCronus)
+            parsed = protocol.parse_records(self._cronus_records)
+            if parsed is None:
+                raise UpdateFailed("Cronus record cache was incomplete")
+            self.data.update(parsed)
+            if self.has_cronus_fuel_estimate:
+                current_time = time.time()
+                elapsed_seconds = current_time - self._last_update_time
+                self._last_update_time = current_time
+                self._update_fuel_tracking(elapsed_seconds)
+                self._update_runtime_tracking(elapsed_seconds)
+                if current_time - self._last_save_time >= 300:
+                    await self.async_save_data()
+                    self._last_save_time = current_time
+            self._last_valid_data = self.data.copy()
+            self._consecutive_failures = 0
+            return self.data
+
+    @callback
+    def _async_external_temp_changed(self, event) -> None:
+        """Handle external temperature sensor state changes."""
+        # Schedule the async calculation
+        self.hass.async_create_task(self._async_calculate_auto_offset())
+
+    async def _async_calculate_auto_offset(self) -> None:
+        """Calculate and apply auto temperature offset based on external sensor.
+
+        This compares the heater's internal temperature sensor with an external
+        reference sensor and calculates an offset to compensate for any difference.
+        The offset is sent to the heater via BLE command 12, so the heater itself
+        uses the corrected temperature for auto-start/stop logic.
+
+        The offset is limited by CONF_AUTO_OFFSET_MAX and throttled to avoid
+        frequent BLE commands.
+        """
+        # Check if auto offset is enabled
+        if not self.data.get("auto_offset_enabled", False):
+            self._logger.debug("Auto offset disabled")
+            return
+
+        external_sensor = self.config_entry.data.get(CONF_EXTERNAL_TEMP_SENSOR, "")
+        if not external_sensor:
+            self._logger.debug("No external temperature sensor configured")
+            return
+
+        # Throttle offset updates to avoid too many BLE commands
+        current_time = time.time()
+        if current_time - self._last_auto_offset_time < AUTO_OFFSET_THROTTLE_SECONDS:
+            self._logger.debug("Auto offset throttled (last update %.0fs ago)",
+                         current_time - self._last_auto_offset_time)
+            return
+
+        # Get external sensor state
+        state = self.hass.states.get(external_sensor)
+        if state is None or state.state in ("unknown", "unavailable"):
+            self._logger.debug("External sensor %s unavailable", external_sensor)
+            return
+
+        try:
+            external_temp = float(state.state)
+        except (ValueError, TypeError):
+            self._logger.warning("Invalid external sensor value: %s", state.state)
+            return
+
+        # Check if external sensor uses Fahrenheit and convert to Celsius
+        # The heater offset calculation must be done in Celsius
+        unit = state.attributes.get("unit_of_measurement", "")
+        if unit in ("°F", "℉", "F"):
+            # Convert Fahrenheit to Celsius: C = (F - 32) * 5/9
+            external_temp_celsius = (external_temp - 32) * 5 / 9
+            self._logger.debug(
+                "External sensor in Fahrenheit: %.1f°F → %.1f°C",
+                external_temp, external_temp_celsius
+            )
+            external_temp = external_temp_celsius
+
+        # Get heater's raw cab temperature (before any offset)
+        raw_heater_temp = self.data.get("cab_temperature_raw")
+        if raw_heater_temp is None:
+            self._logger.debug("Heater raw temperature not available yet")
+            return
+
+        # Round external temp to nearest integer (heater only accepts integer offset)
+        external_temp_rounded = round(external_temp)
+
+        # Calculate the difference: positive offset means heater reads lower than external
+        # If external=22°C and heater=25°C, we need offset=-3 to make heater think it's 22°C
+        difference = external_temp_rounded - raw_heater_temp
+
+        # Only adjust if difference is significant (>= 1°C)
+        if abs(difference) < AUTO_OFFSET_THRESHOLD:
+            self._logger.debug(
+                "Auto offset: difference (%.1f°C) below threshold (%.1f°C), no adjustment",
+                difference, AUTO_OFFSET_THRESHOLD
+            )
+            return
+
+        # Calculate new offset (clamped to -max to +max range)
+        # Both positive and negative offsets now work via BLE
+        max_offset = self.config_entry.data.get(CONF_AUTO_OFFSET_MAX, DEFAULT_AUTO_OFFSET_MAX)
+        max_offset = min(max_offset, MAX_HEATER_OFFSET)  # Cap at 10
+        new_offset = int(max(-max_offset, min(max_offset, difference)))
+
+        # Only send command if offset changed
+        if new_offset != self._current_heater_offset:
+            old_offset = self._current_heater_offset
+            self._last_auto_offset_time = current_time
+
+            self._logger.info(
+                "Auto offset: external=%.1f°C (rounded=%d), heater_raw=%.1f°C, "
+                "difference=%.1f°C, sending offset: %d → +%d°C",
+                external_temp, external_temp_rounded, raw_heater_temp,
+                difference, old_offset, new_offset
+            )
+
+            # Send the offset command to the heater
+            await self.async_set_heater_offset(new_offset)
+
+    async def async_save_data(self) -> None:
+        """Save persistent fuel consumption, runtime data, and settings."""
+        try:
+            data = {
+                # Fuel data
+                STORAGE_KEY_TOTAL_FUEL: self._total_fuel_consumed,
+                STORAGE_KEY_DAILY_FUEL: self._daily_fuel_consumed,
+                STORAGE_KEY_DAILY_DATE: datetime.now().date().isoformat(),
+                STORAGE_KEY_DAILY_HISTORY: self._daily_fuel_history,
+                # Runtime data
+                STORAGE_KEY_TOTAL_RUNTIME: self._total_runtime_seconds,
+                STORAGE_KEY_DAILY_RUNTIME: self._daily_runtime_seconds,
+                STORAGE_KEY_DAILY_RUNTIME_DATE: datetime.now().date().isoformat(),
+                STORAGE_KEY_DAILY_RUNTIME_HISTORY: self._daily_runtime_history,
+                # Fuel level tracking
+                STORAGE_KEY_FUEL_SINCE_RESET: self._fuel_consumed_since_reset,
+                STORAGE_KEY_TANK_CAPACITY: self.data.get("tank_capacity"),
+                STORAGE_KEY_LAST_REFUELED: self.data.get("last_refueled"),
+                # Settings
+                STORAGE_KEY_AUTO_OFFSET_ENABLED: self.data.get("auto_offset_enabled", False),
+                STORAGE_KEY_BURNOFF: self._burnoff.storage_payload(),
+                STORAGE_KEY_BURNOFF_ACCUMULATOR: self._burnoff.accumulator_payload(),
+            }
+            await self._store.async_save(data)
+            self._logger.debug(
+                "Saved data: fuel history=%d entries, runtime history=%d entries, auto_offset=%s",
+                len(self._daily_fuel_history),
+                len(self._daily_runtime_history),
+                self.data.get("auto_offset_enabled", False)
+            )
+        except Exception as err:
+            self._logger.warning("Could not save data: %s", err)
+
+    def _clean_old_history(self) -> None:
+        """Remove history entries older than MAX_HISTORY_DAYS."""
+        if not self._daily_fuel_history:
+            return
+
+        cutoff_date = (datetime.now().date() - timedelta(days=MAX_HISTORY_DAYS)).isoformat()
+        old_keys = [date for date in self._daily_fuel_history if date < cutoff_date]
+
+        for date in old_keys:
+            del self._daily_fuel_history[date]
+
+        if old_keys:
+            self._logger.debug("Removed %d old fuel history entries (before %s)", len(old_keys), cutoff_date)
+
+    def _clean_old_runtime_history(self) -> None:
+        """Remove runtime history entries older than MAX_HISTORY_DAYS."""
+        if not self._daily_runtime_history:
+            return
+
+        cutoff_date = (datetime.now().date() - timedelta(days=MAX_HISTORY_DAYS)).isoformat()
+        old_keys = [date for date in self._daily_runtime_history if date < cutoff_date]
+
+        for date in old_keys:
+            del self._daily_runtime_history[date]
+
+        if old_keys:
+            self._logger.debug("Removed %d old runtime history entries (before %s)", len(old_keys), cutoff_date)
+
+    async def _import_statistics(self, date_str: str, liters: float) -> None:
+        """Import daily fuel consumption into Home Assistant statistics for graphing."""
+        # Skip if recorder is not available
+        if not (recorder := get_instance(self.hass)):
+            self._logger.debug("Recorder not available, skipping statistics import")
+            return
+
+        # Define statistic metadata
+        # statistic_id must be unique per device and lowercase with valid characters
+        device_id = self.address.replace(":", "_").lower()
+        statistic_id = f"{DOMAIN}:{device_id}_daily_fuel_consumed"
+        metadata = StatisticMetaData(
+            has_mean=False,
+            has_sum=True,
+            mean_type=StatisticMeanType.NONE,
+            name=f"Daily Fuel Consumption ({self.address[-5:]})",
+            source=DOMAIN,
+            statistic_id=statistic_id,
+            unit_of_measurement=UnitOfVolume.LITERS,
+            unit_class="volume",
+        )
+
+        # Parse date and create timestamp at midnight UTC (start of hour required by HA)
+        try:
+            date_obj = datetime.fromisoformat(date_str)
+            # Create midnight UTC timestamp - HA requires timestamps at top of hour in UTC
+            # Use replace(tzinfo) instead of as_utc() to avoid timezone conversion
+            timestamp = datetime.combine(date_obj.date(), datetime.min.time()).replace(tzinfo=dt_util.UTC)
+        except (ValueError, TypeError) as err:
+            self._logger.error("Failed to parse date %s: %s", date_str, err)
+            return
+
+        # Create statistic data point
+        statistic = StatisticData(
+            start=timestamp,
+            state=liters,
+            sum=liters,  # Sum for this day
+        )
+
+        # Import the statistic (wrapped in try-except to prevent crashes)
+        # Use async_add_external_statistics for external statistics (uses : delimiter)
+        self._logger.info(
+            "Importing fuel statistic: id=%s, date=%s, value=%.2fL",
+            statistic_id, date_str, liters
+        )
+        try:
+            async_add_external_statistics(self.hass, metadata, [statistic])
+            self._logger.debug("Successfully imported fuel statistic for %s", date_str)
+        except Exception as err:
+            self._logger.warning(
+                "Could not import fuel statistic for %s: %s (statistic_id=%s)",
+                date_str, err, statistic_id
+            )
+
+    async def _import_all_history_statistics(self) -> None:
+        """Import all existing history data into statistics (called at startup)."""
+        if not self._daily_fuel_history:
+            self._logger.debug("No history to import into statistics")
+            return
+
+        self._logger.info("Importing %d days of fuel history into statistics", len(self._daily_fuel_history))
+
+        for date_str, liters in sorted(self._daily_fuel_history.items()):
+            await self._import_statistics(date_str, liters)
+
+        self._logger.info("Completed import of fuel history into statistics")
+
+    async def _import_runtime_statistics(self, date_str: str, hours: float) -> None:
+        """Import daily runtime into Home Assistant statistics for graphing."""
+        # Skip if recorder is not available
+        if not (recorder := get_instance(self.hass)):
+            self._logger.debug("Recorder not available, skipping runtime statistics import")
+            return
+
+        # Define statistic metadata
+        # statistic_id must be unique per device and lowercase with valid characters
+        device_id = self.address.replace(":", "_").lower()
+        statistic_id = f"{DOMAIN}:{device_id}_daily_runtime_hours"
+        metadata = StatisticMetaData(
+            has_mean=False,
+            has_sum=True,
+            mean_type=StatisticMeanType.NONE,
+            name=f"Daily Runtime ({self.address[-5:]})",
+            source=DOMAIN,
+            statistic_id=statistic_id,
+            unit_of_measurement=UnitOfTime.HOURS,
+            unit_class="duration",
+        )
+
+        # Parse date and create timestamp at midnight UTC (start of hour required by HA)
+        try:
+            date_obj = datetime.fromisoformat(date_str)
+            # Create midnight UTC timestamp - HA requires timestamps at top of hour in UTC
+            # Use replace(tzinfo) instead of as_utc() to avoid timezone conversion
+            timestamp = datetime.combine(date_obj.date(), datetime.min.time()).replace(tzinfo=dt_util.UTC)
+        except (ValueError, TypeError) as err:
+            self._logger.error("Failed to parse date %s: %s", date_str, err)
+            return
+
+        # Create statistic data point
+        statistic = StatisticData(
+            start=timestamp,
+            state=hours,
+            sum=hours,  # Sum for this day
+        )
+
+        # Import the statistic (wrapped in try-except to prevent crashes)
+        # Use async_add_external_statistics for external statistics (uses : delimiter)
+        self._logger.info(
+            "Importing runtime statistic: id=%s, date=%s, value=%.2fh",
+            statistic_id, date_str, hours
+        )
+        try:
+            async_add_external_statistics(self.hass, metadata, [statistic])
+            self._logger.debug("Successfully imported runtime statistic for %s", date_str)
+        except Exception as err:
+            self._logger.warning(
+                "Could not import runtime statistic for %s: %s (statistic_id=%s)",
+                date_str, err, statistic_id
+            )
+
+    async def _import_all_runtime_history_statistics(self) -> None:
+        """Import all existing runtime history data into statistics (called at startup)."""
+        if not self._daily_runtime_history:
+            self._logger.debug("No runtime history to import into statistics")
+            return
+
+        self._logger.info("Importing %d days of runtime history into statistics", len(self._daily_runtime_history))
+
+        for date_str, hours in sorted(self._daily_runtime_history.items()):
+            await self._import_runtime_statistics(date_str, hours)
+
+        self._logger.info("Completed import of runtime history into statistics")
+
+    def _estimate_hcalory_power_level(self) -> int:
+        """Estimate Hcalory power level in Temperature mode (issue #47).
+
+        Hcalory doesn't report power level when in Temperature mode, so we
+        estimate it based on the temperature difference between target and actual.
+
+        Logic:
+        - Small diff (0-2): Level 1-2 (low heat needed)
+        - Medium diff (3-5): Level 3-5 (moderate heat)
+        - Large diff (6-10): Level 6-8 (high heat)
+        - Very large diff (>10): Level 9-10 (max heat)
+
+        Returns:
+            Estimated power level (1-10)
+        """
+        target_temp = self.data.get("set_temp")
+        cab_temp = self.data.get("cab_temperature")
+
+        if target_temp is None or cab_temp is None:
+            return 1  # Default to minimum if no data
+
+        # Calculate temperature difference (handle both Celsius and Fahrenheit)
+        if self._heater_uses_fahrenheit:
+            # Convert to Celsius for consistent estimation
+            target_c = (target_temp - 32) * 5 / 9
+            cab_c = (cab_temp - 32) * 5 / 9
+            temp_diff = target_c - cab_c
+        else:
+            temp_diff = target_temp - cab_temp
+
+        # Estimate power level based on temperature difference
+        if temp_diff <= 0:
+            # Already at or above target - maintain low
+            estimated_level = 1
+        elif temp_diff <= 2:
+            estimated_level = 2
+        elif temp_diff <= 5:
+            estimated_level = min(3 + int(temp_diff - 3), 5)  # 3-5
+        elif temp_diff <= 10:
+            estimated_level = min(6 + int((temp_diff - 6) / 2), 8)  # 6-8
+        else:
+            estimated_level = min(9 + int((temp_diff - 11) / 5), 10)  # 9-10
+
+        self._logger.debug(
+            "Estimated Hcalory power level: %d (temp_diff=%.1f°C, target=%s, cab=%s)",
+            estimated_level, temp_diff, target_temp, cab_temp
+        )
+        return estimated_level
+
+    def _is_running_for_tracking(self) -> bool:
+        """Return whether the current protocol reports an active heater."""
+        if self._protocol_mode == 9:
+            return self.data.get("running_state") == RUNNING_STATE_ON
+        return self.data.get("running_step") == RUNNING_STEP_RUNNING
+
+    def _cronus_fuel_rate(self) -> float:
+        """Return the selected Cronus model's estimated current rate in L/h."""
+        profile = self.cronus_fuel_profile
+        if profile is None or not self._is_running_for_tracking():
+            return 0.0
+        mode = self.data.get("cronus_mode")
+        if mode == "ventilation":
+            return 0.0
+        return float(profile.get(mode, profile["heating"]))
+
+    def _calculate_fuel_consumption(self, elapsed_seconds: float) -> float:
+        """Calculate fuel consumed based on power level and elapsed time.
+
+        Returns fuel consumed in liters.
+        """
+        # Only consume fuel when actually running.
+        if not self._is_running_for_tracking():
+            return 0.0
+
+        if self._protocol_mode == 9:
+            return self._cronus_fuel_rate() * elapsed_seconds / 3600.0
+
+        power_level = self.data.get("set_level")
+
+        # Issue #47: Hcalory doesn't report power level in Temperature mode
+        # Estimate it based on temperature difference
+        if power_level is None or power_level == 1:
+            if self._protocol_mode == 7:  # Hcalory
+                running_mode = self.data.get("running_mode")
+                if running_mode == 2:  # Temperature mode
+                    power_level = self._estimate_hcalory_power_level()
+                    self._logger.debug(
+                        "Hcalory Temperature mode: estimated power level %d for fuel calculation",
+                        power_level
+                    )
+
+        if power_level is None:
+            power_level = 1  # Fallback to minimum
+
+        consumption_rate = FUEL_CONSUMPTION_TABLE.get(power_level, 0.16)  # L/h
+
+        # Calculate fuel consumed in this interval
+        hours_elapsed = elapsed_seconds / 3600.0
+        fuel_consumed = consumption_rate * hours_elapsed
+
+        return fuel_consumed
+
+    def _update_fuel_tracking(self, elapsed_seconds: float) -> None:
+        """Update fuel consumption tracking."""
+        fuel_consumed = self._calculate_fuel_consumption(elapsed_seconds)
+
+        if fuel_consumed > 0:
+            self._total_fuel_consumed += fuel_consumed
+            self._daily_fuel_consumed += fuel_consumed
+            self._fuel_consumed_since_reset += fuel_consumed
+
+        # Calculate instantaneous consumption rate.
+        if self._protocol_mode == 9:
+            hourly_consumption = self._cronus_fuel_rate()
+        else:
+            power_level = self.data.get("set_level")
+
+            # Issue #47: Estimate power level for Hcalory in Temperature mode
+            if power_level is None or power_level == 1:
+                if self._protocol_mode == 7:  # Hcalory
+                    running_mode = self.data.get("running_mode")
+                    if running_mode == 2:  # Temperature mode
+                        power_level = self._estimate_hcalory_power_level()
+
+            if power_level is None:
+                power_level = 1  # Fallback
+
+            hourly_consumption = (
+                FUEL_CONSUMPTION_TABLE.get(power_level, 0.16)
+                if self._is_running_for_tracking()
+                else 0.0
+            )
+
+        # Update data dictionary
+        self.data["hourly_fuel_consumption"] = round(hourly_consumption, 2)
+        self.data["daily_fuel_consumed"] = round(self._daily_fuel_consumed, 2)
+        self.data["total_fuel_consumed"] = round(self._total_fuel_consumed, 2)
+        self.data["fuel_consumed_since_reset"] = round(self._fuel_consumed_since_reset, 2)
+        self._update_fuel_remaining()
+
+    def _update_fuel_remaining(self) -> None:
+        """Update estimated fuel remaining based on tank capacity and consumption since reset."""
+        tank_capacity = self.data.get("tank_capacity")
+        if tank_capacity is None or tank_capacity <= 0:
+            # Tank capacity not set — can't estimate
+            self.data["fuel_remaining"] = None
+            return
+
+        remaining = tank_capacity - self._fuel_consumed_since_reset
+        self.data["fuel_remaining"] = round(max(0.0, remaining), 2)
+
+    async def async_reset_fuel_level(self) -> None:
+        """Reset fuel level tracking (called when user refuels)."""
+        self._fuel_consumed_since_reset = 0.0
+        self.data["fuel_consumed_since_reset"] = 0.0
+        self.data["last_refueled"] = dt_util.now().isoformat()
+        self._update_fuel_remaining()
+        await self.async_save_data()
+        self._logger.info("⛽ Fuel level reset (tank refueled at %s)", self.data["last_refueled"])
+        self.async_set_updated_data(self.data)
+
+    async def async_set_tank_capacity(self, capacity: int) -> None:
+        """Set the user-defined tank capacity in liters (1-100)."""
+        capacity = max(1, min(100, capacity))
+        self.data["tank_capacity"] = capacity
+        self._update_fuel_remaining()
+        await self.async_save_data()
+        self._logger.info("⛽ Tank capacity set to %dL", capacity)
+        self.async_set_updated_data(self.data)
+
+    async def async_set_current_fuel_level(self, current_level: float) -> None:
+        """Set the current fuel level manually (for partial refills).
+
+        Updates the internal fuel consumed counter to reflect the new level.
+        Useful when adding fuel without completely filling the tank.
+
+        Feature requested by @Wheemer in issue #38.
+
+        Args:
+            current_level: Current fuel level in liters (0 to tank_capacity)
+        """
+        capacity = self.data.get("tank_capacity", 0)
+        if capacity == 0:
+            self._logger.warning("Cannot set fuel level: tank capacity not configured")
+            return
+
+        # Clamp value between 0 and capacity
+        current_level = max(0, min(capacity, current_level))
+
+        # Calculate new consumed: capacity - current_level
+        new_consumed = capacity - current_level
+
+        # Update internal counter
+        self._total_fuel_consumed = new_consumed
+
+        # Recalculate estimated remaining
+        self._update_fuel_remaining()
+
+        # Save to persistent storage
+        await self.async_save_data()
+
+        self._logger.info(
+            "⛽ Manual fuel level set to %.1fL (consumed: %.2fL)",
+            current_level, new_consumed
+        )
+        self.async_set_updated_data(self.data)
+
+    def _update_runtime_tracking(self, elapsed_seconds: float) -> None:
+        """Update runtime tracking."""
+        # Only count runtime when the heater is actually running.
+        if self._is_running_for_tracking():
+            self._total_runtime_seconds += elapsed_seconds
+            self._daily_runtime_seconds += elapsed_seconds
+            self._burnoff.accumulate_hours(elapsed_seconds)
+
+        # Update data dictionary (convert to hours for display)
+        self.data["daily_runtime_hours"] = round(self._daily_runtime_seconds / 3600.0, 2)
+        self.data["total_runtime_hours"] = round(self._total_runtime_seconds / 3600.0, 2)
+        self._burnoff.publish_accumulator()
+        self._burnoff.maybe_start_in_run()
+
+    async def _check_daily_reset(self) -> None:
+        """Check if we need to reset daily fuel counter (runs every update, even if offline)."""
+        current_date = datetime.now().date().isoformat()
+        if current_date != self._last_reset_date:
+            # Save yesterday's consumption to history before resetting
+            if self._daily_fuel_consumed > 0:
+                liters_consumed = round(self._daily_fuel_consumed, 2)
+                self._daily_fuel_history[self._last_reset_date] = liters_consumed
+                self._logger.info(
+                    "New day detected: saved %s consumption (%.2fL) to history",
+                    self._last_reset_date,
+                    liters_consumed
+                )
+
+                # Import into statistics for native graphing
+                await self._import_statistics(self._last_reset_date, liters_consumed)
+
+            self._logger.info(
+                "Resetting daily fuel counter from %.2fL to 0.0L (was %s, now %s)",
+                self._daily_fuel_consumed,
+                self._last_reset_date,
+                current_date
+            )
+
+            self._daily_fuel_consumed = 0.0
+            self._last_reset_date = current_date
+            self.data["daily_fuel_consumed"] = 0.0
+
+            # Clean old history and update data
+            self._clean_old_history()
+            self.data["daily_fuel_history"] = self._daily_fuel_history
+
+            # Save immediately after reset to persist the new day and history
+            await self.async_save_data()
+
+    async def _check_daily_runtime_reset(self) -> None:
+        """Check if we need to reset daily runtime counter (runs every update, even if offline)."""
+        current_date = datetime.now().date().isoformat()
+        if current_date != self._last_runtime_reset_date:
+            # Save yesterday's runtime to history before resetting
+            if self._daily_runtime_seconds > 0:
+                hours_running = round(self._daily_runtime_seconds / 3600.0, 2)
+                self._daily_runtime_history[self._last_runtime_reset_date] = hours_running
+                self._logger.info(
+                    "New day detected: saved %s runtime (%.2fh) to history",
+                    self._last_runtime_reset_date,
+                    hours_running
+                )
+
+                # Import into statistics for native graphing
+                await self._import_runtime_statistics(self._last_runtime_reset_date, hours_running)
+
+            self._logger.info(
+                "Resetting daily runtime counter from %.2fh to 0.0h (was %s, now %s)",
+                self._daily_runtime_seconds / 3600.0,
+                self._last_runtime_reset_date,
+                current_date
+            )
+
+            self._daily_runtime_seconds = 0.0
+            self._last_runtime_reset_date = current_date
+            self.data["daily_runtime_hours"] = 0.0
+
+            # Clean old history and update data
+            self._clean_old_runtime_history()
+            self.data["daily_runtime_history"] = self._daily_runtime_history
+
+            # Save immediately after reset to persist the new day and history
+            await self.async_save_data()
+
+    # Fields that represent volatile heater state (cleared on disconnect)
+    _VOLATILE_FIELDS = (
+        "case_temperature", "cab_temperature", "cab_temperature_raw",
+        "supply_voltage", "running_state", "running_step", "running_mode",
+        "set_level", "set_temp", "altitude", "error_code",
+        "hourly_fuel_consumption", "co_ppm", "remain_run_time",
+    )
+
+    def _clear_sensor_values(self) -> None:
+        """Clear volatile sensor values to show as unavailable."""
+        for key in self._VOLATILE_FIELDS:
+            self.data[key] = None
+
+    def _restore_stale_data(self) -> None:
+        """Restore last valid sensor values during temporary connection issues."""
+        if self._last_valid_data:
+            for key in self._VOLATILE_FIELDS:
+                if key in self._last_valid_data:
+                    self.data[key] = self._last_valid_data[key]
+
+    def _save_valid_data(self) -> None:
+        """Save current sensor values as last valid data."""
+        self._last_valid_data = {
+            key: self.data.get(key) for key in self._VOLATILE_FIELDS
+        }
+
+    def _handle_connection_failure(self, err: Exception) -> None:
+        """Handle connection failure with stale data tolerance."""
+        self._consecutive_failures += 1
+
+        if self._consecutive_failures <= self._max_stale_cycles:
+            # Keep last valid values and stay "connected" during tolerance window
+            self._restore_stale_data()
+            self._logger.debug(
+                "Update failed (attempt %d/%d), keeping last values: %s",
+                self._consecutive_failures,
+                self._max_stale_cycles,
+                err
+            )
+        else:
+            # Too many failures, mark disconnected and clear values
+            self.data["connected"] = False
+            self._clear_sensor_values()
+            if self._consecutive_failures == self._max_stale_cycles + 1:
+                self._logger.warning(
+                    "Vevor Heater offline after %d attempts: %s",
+                    self._consecutive_failures,
+                    err
+                )
+
+    async def _async_update_data(self) -> dict[str, Any]:
+        """Update data from the heater."""
+        # Check for daily reset FIRST, even if heater is offline
+        # This ensures the daily counters reset at midnight regardless of connection status
+        await self._check_daily_reset()
+        await self._check_daily_runtime_reset()
+
+        if not self._client or not self._client.is_connected:
+            try:
+                await self._ensure_connected()
+                # Beta.34: Auto-sync time on successful connection (@Wheemer, issue #38)
+                # This was previously only done for Hcalory MVP2, now extended to all protocols
+                if not self._time_synced_this_session and not getattr(self, "_is_cronus_device", False):
+                    try:
+                        self._logger.debug("Auto-syncing time after connection...")
+                        await asyncio.sleep(0.5)  # Give heater time to initialize
+                        await self.async_sync_time()
+                        self._time_synced_this_session = True
+                        self._logger.info("✅ Auto time sync completed")
+                    except Exception as sync_err:
+                        self._logger.debug("Auto time sync failed (non-critical): %s", sync_err)
+            except Exception as err:
+                self._handle_connection_failure(err)
+                raise UpdateFailed(f"Failed to connect: {err}")
+
+        try:
+            if getattr(self, "_is_cronus_device", False):
+                return await self._async_update_cronus_data()
+
+            # Request status with retries (up to 3 attempts)
+            max_retries = 3
+            status = False
+            for attempt in range(max_retries):
+                status = await self._send_command(1, 0)
+                if status:
+                    break
+                if attempt < max_retries - 1:
+                    self._logger.debug(
+                        "Status request timed out (attempt %d/%d), retrying...",
+                        attempt + 1, max_retries
+                    )
+                    await asyncio.sleep(1.0)
+
+            # MVP1 -> MVP2 fallback: If MVP1 query failed (now the default) and
+            # protocol is Hcalory with bd39 service, try MVP2 query as fallback.
+            # The library now defaults to MVP1 query since Acropolis9064 proves it works.
+            if (not status and
+                self._protocol and
+                hasattr(self._protocol, '_is_mvp2') and
+                self._protocol._is_mvp2 and
+                hasattr(self._protocol, 'prefer_mvp1_query') and
+                self._protocol.prefer_mvp1_query):
+                self._logger.info(
+                    "🔄 MVP1 query failed, trying MVP2 fallback (dpID 0A0A)..."
+                )
+                # Temporarily switch to MVP2 query style
+                self._protocol.set_prefer_mvp1_query(False)
+                mvp2_packet = self._protocol.build_command(1, 0, self._passkey)
+                self._notification_data = None
+                try:
+                    await self._write_gatt(mvp2_packet)
+                    self._logger.debug("MVP2 fallback packet: %s", mvp2_packet.hex())
+                    # Wait for response
+                    for _ in range(50):  # 5 seconds
+                        await asyncio.sleep(0.1)
+                        if self._notification_data:
+                            self._logger.info(
+                                "✅ MVP2 fallback succeeded! Using MVP2 query style."
+                            )
+                            # Keep prefer_mvp1_query=False for future queries
+                            status = True
+                            break
+                except Exception as e:
+                    self._logger.debug("MVP2 fallback write failed: %s", e)
+                # If MVP2 also failed, restore MVP1 preference for next attempt
+                if not status:
+                    self._protocol.set_prefer_mvp1_query(True)
+
+            if status:
+                self.data["connected"] = True
+                # Reset failure counter and save valid data on success
+                self._consecutive_failures = 0
+                self._save_valid_data()
+
+                # Update fuel consumption and runtime tracking
+                current_time = time.time()
+                elapsed_seconds = current_time - self._last_update_time
+                self._last_update_time = current_time
+
+                self._update_fuel_tracking(elapsed_seconds)
+                self._update_runtime_tracking(elapsed_seconds)
+
+                # Save data periodically (every 5 minutes)
+                if current_time - self._last_save_time >= 300:
+                    await self.async_save_data()
+                    self._last_save_time = current_time
+
+                return self.data
+            else:
+                self._handle_connection_failure(Exception("No status received"))
+                # During stale tolerance window, return stale data instead of
+                # raising UpdateFailed — keeps entities available
+                if self._consecutive_failures <= self._max_stale_cycles:
+                    return self.data
+                raise UpdateFailed("No status received from heater")
+
+        except UpdateFailed:
+            raise
+        except Exception as err:
+            self._logger.debug("Error updating data: %s", err)
+            self._handle_connection_failure(err)
+            if self._consecutive_failures <= self._max_stale_cycles:
+                return self.data
+            raise UpdateFailed(f"Error updating data: {err}")
+
+    async def _ensure_connected(self) -> None:
+        """Ensure BLE connection is established with exponential backoff."""
+        # Check if already connected
+        if self._client and self._client.is_connected:
+            self._connection_attempts = 0  # Reset on successful connection
+            return
+
+        # Clean up any stale client before attempting new connection
+        await self._cleanup_connection()
+
+        # Exponential backoff: 5s, 10s, 20s, 40s
+        current_time = time.time()
+        if self._connection_attempts > 0:
+            backoff_delays = [5, 10, 20, 40]
+            delay_index = min(self._connection_attempts - 1, len(backoff_delays) - 1)
+            required_delay = backoff_delays[delay_index]
+            time_since_last = current_time - self._last_connection_attempt
+
+            if time_since_last < required_delay:
+                remaining = required_delay - time_since_last
+                self._logger.debug(
+                    "Waiting %.1fs before reconnection attempt %d",
+                    remaining,
+                    self._connection_attempts + 1
+                )
+                await asyncio.sleep(remaining)
+
+        self._connection_attempts += 1
+        self._last_connection_attempt = time.time()
+
+        self._logger.debug(
+            "Connecting to Vevor Heater at %s (attempt %d)",
+            self._ble_device.address,
+            self._connection_attempts
+        )
+
+        try:
+            # Establish connection with limited retries to avoid log spam
+            # bleak_retry_connector will handle internal retries
+            self._client = await establish_connection(
+                BleakClient,
+                self._ble_device,
+                self._ble_device.address,
+                max_attempts=3,  # Limit internal retries
+            )
+
+            # Verify services are available
+            if not self._client.services:
+                self._logger.warning("No services discovered, triggering service refresh")
+                # Services might not be cached, disconnect and let next attempt retry
+                await self._cleanup_connection()
+                raise BleakError("No services available")
+
+            # Get characteristic - try Vevor UUIDs first, then ABBA, then Hcalory
+            self._characteristic = None
+            self._active_char_uuid = None
+            self._is_abba_device = False
+            self._abba_write_char = None
+            self._is_hcalory_device = False
+            self._hcalory_write_char = None
+            self._is_heatgenie_device = False
+            self._heatgenie_write_char = None
+            self._is_cronus_device = False
+            self._cronus_write_char = None
+            self._cronus_records = {}
+            self._cronus_pending_id = None
+            self._cronus_pending_data = bytearray()
+            self._cronus_expected_length = 0
+
+            # First, check for Hcalory MVP2 device (service bd39)
+            for service in self._client.services:
+                if service.uuid.lower() == HCALORY_MVP2_SERVICE_UUID.lower():
+                    self._logger.info("🔍 Detected Hcalory MVP2 heater (service bd39)")
+                    self._is_hcalory_device = True
+                    self._protocol_mode = 7  # Hcalory protocol
+                    self._protocol = self._protocols[7]
+                    # Set MVP2 flag on the protocol
+                    if hasattr(self._protocol, 'set_mvp_version'):
+                        self._protocol.set_mvp_version(True)
+
+                    # Optimize update interval for Hcalory (@Xev: 15s → 5s)
+                    # Hcalory needs faster polling for stability (app polls ~2s)
+                    self.update_interval = timedelta(seconds=UPDATE_INTERVAL_HCALORY)
+                    self._logger.info("⏱️ Optimized update interval for Hcalory: %ds", UPDATE_INTERVAL_HCALORY)
+
+                    # Log all characteristics in this service for debugging
+                    char_list = [f"{c.uuid} (props: {c.properties})" for c in service.characteristics]
+                    self._logger.info("📋 Hcalory service characteristics: %s", char_list)
+
+                    # Find notify and write characteristics
+                    for char in service.characteristics:
+                        if char.uuid.lower() == HCALORY_MVP2_NOTIFY_UUID.lower():
+                            self._characteristic = char
+                            self._active_char_uuid = HCALORY_MVP2_NOTIFY_UUID
+                            self._logger.info("✅ Found Hcalory notify characteristic (bdf8): %s", char.uuid)
+                        elif char.uuid.lower() == HCALORY_MVP2_WRITE_UUID.lower():
+                            self._hcalory_write_char = char
+                            self._logger.info("✅ Found Hcalory write characteristic (bdf7): %s", char.uuid)
+
+                    # Warning if write characteristic not found
+                    if not self._hcalory_write_char:
+                        self._logger.warning(
+                            "⚠️ Hcalory device but bdf7 write characteristic not found!"
+                        )
+                    break
+
+            # Second, check for ABBA/HeaterCC device (service fff0)
+            if not self._is_hcalory_device:
+                for service in self._client.services:
+                    if service.uuid.lower() == ABBA_SERVICE_UUID.lower():
+                        self._logger.info("🔍 Detected ABBA/HeaterCC heater (service fff0)")
+                        self._is_abba_device = True
+                        self._protocol_mode = 5  # ABBA protocol
+                        self._protocol = self._protocols[5]
+
+                        # Log all characteristics in this service for debugging
+                        char_list = [f"{c.uuid} (props: {c.properties})" for c in service.characteristics]
+                        self._logger.info("📋 ABBA service characteristics: %s", char_list)
+
+                        # Find both characteristics before assigning direction.
+                        fff1_char = None
+                        fff2_char = None
+                        for char in service.characteristics:
+                            if char.uuid.lower() == DZ06_NEO_WRITE_UUID.lower():
+                                fff1_char = char
+                            elif char.uuid.lower() == DZ06_NEO_NOTIFY_UUID.lower():
+                                fff2_char = char
+
+                        if (
+                            fff1_char and fff2_char
+                            and ("write" in fff1_char.properties or "write-without-response" in fff1_char.properties)
+                            and "notify" in fff2_char.properties
+                        ):
+                            self._logger.info("Detected DZ06 split FFF0 layout: FFF1=write, FFF2=notify")
+                            self._characteristic = fff2_char
+                            self._active_char_uuid = fff2_char.uuid
+                            self._abba_write_char = fff1_char
+                        else:
+                            self._characteristic = fff1_char
+                            self._active_char_uuid = fff1_char.uuid if fff1_char else None
+                            self._abba_write_char = fff2_char
+
+                        # Warning if write characteristic not found
+                        if not self._abba_write_char:
+                            self._logger.warning(
+                                "⚠️ ABBA device but fff2 write characteristic not found! "
+                                "Will try writing to fff1 as fallback."
+                            )
+                            # Fall back to using fff1 for writing if fff2 not available
+                            self._abba_write_char = self._characteristic
+                        break
+
+            # HeatGenie uses the Environmental Sensing service only with
+            # app-recognized Boygu/C1...FE identities.
+            if not self._is_abba_device and not self._is_hcalory_device and self.is_heatgenie_device:
+                for service in self._client.services:
+                    if service.uuid.lower() != HEATGENIE_SERVICE_UUID.lower():
+                        continue
+                    notify_chars = [
+                        char
+                        for char in service.characteristics
+                        if "notify" in char.properties or "indicate" in char.properties
+                    ]
+                    write_chars = [
+                        char
+                        for char in service.characteristics
+                        if "write" in char.properties or "write-without-response" in char.properties
+                    ]
+                    if len(notify_chars) != 1 or len(write_chars) != 1:
+                        self._logger.warning(
+                            "HeatGenie service requires one notify/indicate and one write characteristic"
+                        )
+                        break
+                    self._is_heatgenie_device = True
+                    self._heatgenie_write_char = write_chars[0]
+                    self._characteristic = notify_chars[0]
+                    self._active_char_uuid = notify_chars[0].uuid
+                    self._protocol_mode = 8
+                    self._protocol = self._protocols[8]
+                    self._logger.info("Detected HeatGenie/Boygu heater")
+                    break
+
+            # ThermoConnect scans only CRONUS names, then locates this exact
+            # proprietary notify/write UUID pair across the discovered GATT tree.
+            if (
+                not self._is_abba_device
+                and not self._is_hcalory_device
+                and not self._is_heatgenie_device
+                and self.is_cronus_device
+            ):
+                all_chars = [
+                    char
+                    for service in self._client.services
+                    for char in service.characteristics
+                ]
+                notify_char = next(
+                    (char for char in all_chars if char.uuid.lower() == CRONUS_NOTIFY_UUID),
+                    None,
+                )
+                write_char = next(
+                    (char for char in all_chars if char.uuid.lower() == CRONUS_WRITE_UUID),
+                    None,
+                )
+                if notify_char and write_char and (
+                    "notify" in notify_char.properties or "indicate" in notify_char.properties
+                ) and ("write" in write_char.properties or "write-without-response" in write_char.properties):
+                    self._is_cronus_device = True
+                    self._cronus_write_char = write_char
+                    self._characteristic = notify_char
+                    self._active_char_uuid = notify_char.uuid
+                    self._protocol_mode = 9
+                    self._protocol = self._protocols[9]
+                    self._logger.info("Detected Webasto ThermoConnect Cronus controller")
+
+            # If not ABBA, Hcalory, HeatGenie, or Cronus, try Vevor UUIDs
+            if (
+                not self._is_abba_device
+                and not self._is_hcalory_device
+                and not self._is_heatgenie_device
+                and not self._is_cronus_device
+            ):
+                # Define UUID pairs to try: (service_uuid, characteristic_uuid)
+                uuid_pairs = [
+                    (SERVICE_UUID, CHARACTERISTIC_UUID),
+                    (SERVICE_UUID_ALT, CHARACTERISTIC_UUID_ALT),
+                ]
+
+                for service_uuid, char_uuid in uuid_pairs:
+                    for service in self._client.services:
+                        if service.uuid.lower() == service_uuid.lower():
+                            # Log all characteristics in this service for debugging
+                            char_list = [f"{c.uuid} (props: {c.properties})" for c in service.characteristics]
+                            self._logger.info("📋 Vevor/Sunster service %s characteristics: %s", service_uuid[-4:], char_list)
+
+                            for char in service.characteristics:
+                                if char.uuid.lower() == char_uuid.lower():
+                                    self._characteristic = char
+                                    self._active_char_uuid = char_uuid
+                                    self._logger.info(
+                                        "✅ Found Vevor heater characteristic: %s (service: %s)",
+                                        char_uuid, service_uuid
+                                    )
+                            if self._characteristic:
+                                break
+                    if self._characteristic:
+                        break
+
+            if not self._characteristic:
+                # Log available services for debugging
+                available_services = [s.uuid for s in self._client.services]
+                self._logger.error(
+                    "Could not find heater characteristic. Available services: %s",
+                    available_services
+                )
+                await self._cleanup_connection()
+                raise BleakError("Could not find heater characteristic")
+
+            # Start notifications on the discovered characteristic
+            if "notify" in self._characteristic.properties or "indicate" in self._characteristic.properties:
+                await self._client.start_notify(
+                    self._active_char_uuid, self._notification_callback
+                )
+                self._logger.debug("Started notifications on %s", self._active_char_uuid)
+            else:
+                self._logger.warning("Characteristic does not support notify")
+
+            # CRITICAL: For Hcalory MVP2, send password handshake BEFORE any other command
+            # The heater requires authentication before accepting any commands
+            if (self._protocol and
+                hasattr(self._protocol, 'needs_password_handshake') and
+                self._protocol.needs_password_handshake):
+                self._logger.info("🔐 MVP2 detected - sending password handshake before wake-up ping")
+                auth_success = await self._async_password_handshake(max_retries=3)
+                if not auth_success:
+                    self._logger.warning("⚠️ MVP2 authentication failed, but continuing anyway")
+                    # Continue anyway - will retry in _send_command if needed
+
+            if self.is_dz06_neo:
+                if not await self._send_dz06_neo_auth():
+                    await self._cleanup_connection()
+                    raise BleakError("DZ06 Neo authorization failed")
+            elif self._is_cronus_device:
+                self._logger.debug("Cronus ready; polling record cache")
+            else:
+                await self._send_wake_up_ping()
+
+            self._connection_attempts = 0  # Reset on successful connection
+            self._logger.info("Successfully connected to Vevor Heater")
+
+        except Exception as err:
+            # Clean up on any connection failure
+            await self._cleanup_connection()
+            raise
+
+    @callback
+    def _notification_callback(self, _sender: int, data: bytearray) -> None:
+        """Handle notification from heater."""
+        if self.is_dz06_neo:
+            self._notification_data = bytearray(data)
+            if len(data) == 24 and data[:2] == bytearray((0x5C, 0x16)):
+                minimum, maximum = data[4], data[5]
+                if minimum <= maximum:
+                    self.data["neo_min_target"] = minimum
+                    self.data["neo_max_target"] = maximum
+            if len(data) == 39 and data[:2] == bytearray((0x5A, 0x25)):
+                run_type = data[34]
+                neo_error_raw = data[4]
+                self.data.update({
+                    "connected": True,
+                    "supply_voltage": int.from_bytes(data[5:7], "big") / 10.0,
+                    "set_temp": float(data[15]),
+                    "cab_temperature": float(int.from_bytes(data[35:36], "big", signed=True)),
+                    # Neo app normalizes warning bytes above 1 by subtracting 1.
+                    "neo_error_raw": neo_error_raw,
+                    "error_code": neo_error_raw - 1 if neo_error_raw > 1 else neo_error_raw,
+                    "neo_fire_temperature": int.from_bytes(data[18:20], "big", signed=True),
+                    "neo_fan_speed_raw": int.from_bytes(data[7:9], "big"),
+                    "neo_frequency_raw": data[16],
+                    "neo_fuel_raw": data[17],
+                    "neo_remaining_time_raw": data[26],
+                    "neo_igniter_current_raw": int.from_bytes(data[13:15], "big"),
+                    "altitude": int.from_bytes(data[32:34], "big"),
+                    "neo_run_type": run_type,
+                })
+                raw_state = data[3]
+                self.data["neo_raw_state"] = raw_state
+                if raw_state == 1:
+                    # The Neo app labels state 1 as self-check, before heating.
+                    self.data["running_state"] = RUNNING_STATE_ON
+                    self.data["running_step"] = None
+                elif raw_state in (2, 3, 4, 5):
+                    self.data["running_state"] = RUNNING_STATE_ON
+                    self.data["running_step"] = RUNNING_STEP_RUNNING
+                elif raw_state in (6, 7, 8):
+                    self.data["running_state"] = RUNNING_STATE_OFF
+                    self.data["running_step"] = RUNNING_STEP_COOLDOWN
+                elif raw_state == 0:
+                    self.data["running_state"] = RUNNING_STATE_OFF
+                    self.data["running_step"] = RUNNING_STEP_STANDBY
+                # Sunster Neo 1.0.9 updateLevel(): targets 8, 11, ... 35
+                # represent requested levels 1..10 in manual/Level mode.
+                # This is a setpoint, not a measured output-power level.
+                target = data[15]
+                self.data["set_level"] = (
+                    min(10, 1 + (target - 8) // 3)
+                    if run_type == 1 and 8 <= target <= 36
+                    else None
+                )
+                if run_type == 1:
+                    self.data["running_mode"] = RUNNING_MODE_LEVEL
+                elif run_type == 2:
+                    self.data["running_mode"] = RUNNING_MODE_TEMPERATURE
+                self._burnoff.observe_status()
+                self._burnoff.schedule_abort_if_ecu_stopped()
+            return
+        if getattr(self, "_is_cronus_device", False):
+            self._handle_cronus_notification(bytearray(data))
+            return
+
+        # Log ALL received data for debugging
+        self._logger.info(
+            "📩 Received BLE data (%d bytes): %s",
+            len(data),
+            data.hex()
+        )
+        try:
+            self._parse_response(data)
+        except Exception as err:
+            self._logger.error("Error parsing notification: %s", err)
+
+    def _detect_protocol(
+        self, data: bytearray, header: int
+    ) -> tuple[HeaterProtocol | None, bytearray | None]:
+        """Detect protocol from BLE data and return (protocol, data_to_parse).
+
+        For encrypted protocols, data_to_parse is already decrypted.
+        """
+        if getattr(self, "_is_heatgenie_device", False):
+            return self._protocols[8], data
+
+        # Hcalory protocol (MVP1/MVP2) - detected by service UUID or header 0x0002
+        if self._is_hcalory_device or header == 0x0002:
+            return self._protocols[7], data
+
+        # CBFF/FEAA protocol - if already in mode 6 (set by AA77 beacon),
+        # route all data to CBFF protocol. The encrypted header varies by MAC
+        # (e.g. 0xCBFF, 0xCA88) so we cannot match on raw bytes.
+        # The CBFF protocol.parse() handles decryption internally.
+        if self._protocol_mode == 6:
+            return self._protocols[6], data
+
+        if header == PROTOCOL_HEADER_CBFF:
+            return self._protocols[6], data
+
+        cbff_protocol = self._protocols[6]
+        if isinstance(cbff_protocol, ProtocolCBFF) and cbff_protocol.is_feaa_frame(data):
+            return cbff_protocol, data
+
+        if header == PROTOCOL_HEADER_ABBA or self._is_abba_device:
+            return self._protocols[5], data
+
+        if len(data) < 17:
+            return None, None
+
+        if header == 0xAA55 and len(data) in (18, 20):
+            return self._protocols[1], data
+
+        if header == 0xAA66 and len(data) == 20:
+            return self._protocols[3], data
+
+        if len(data) == 48:
+            decrypted = _decrypt_data(data)
+            inner = (_u8_to_number(decrypted[0]) << 8) | _u8_to_number(decrypted[1])
+            if inner == 0xAA55:
+                return self._protocols[2], decrypted
+            if inner == 0xAA66:
+                return self._protocols[4], decrypted
+
+        return None, None
+
+    def _parse_response(self, data: bytearray) -> None:
+        """Parse response from heater using protocol handler classes."""
+        if len(data) < 8:
+            # AA77 ACK is 10 bytes - check before discarding
+            header_short = (_u8_to_number(data[0]) << 8) | _u8_to_number(data[1]) if len(data) >= 2 else 0
+            if header_short == PROTOCOL_HEADER_AA77:
+                self._logger.debug("AA77 ACK received (%d bytes)", len(data))
+                self._notification_data = data
+                return
+            self._logger.debug("Response too short: %d bytes", len(data))
+            return
+
+        header = (_u8_to_number(data[0]) << 8) | _u8_to_number(data[1])
+
+        # Check for AA77 (Sunster V2.1 locked state / command ACK)
+        if header == PROTOCOL_HEADER_AA77:
+            self._logger.debug("AA77 received (%d bytes)", len(data))
+            # Enable V2.1 encrypted mode on CBFF protocol AND switch to it
+            cbff_protocol = self._protocols.get(6)
+            if cbff_protocol and hasattr(cbff_protocol, 'set_v21_mode'):
+                if not cbff_protocol.v21_mode:
+                    self._logger.info(
+                        "🔐 Sunster V2.1 mode detected (AA77 beacon). "
+                        "Switching to CBFF encrypted protocol (mode 6)."
+                    )
+                    cbff_protocol.set_v21_mode(True)
+                # CRITICAL: Switch protocol mode to CBFF so commands are encrypted
+                if self._protocol_mode != 6:
+                    self._logger.info(
+                        "📡 Protocol switch: %d -> 6 (CBFF/Sunster V2.1)",
+                        self._protocol_mode
+                    )
+                    self._protocol_mode = 6
+                    self._protocol = cbff_protocol
+                self._queue_v21_handshake(cbff_protocol)
+            self._notification_data = data
+            return
+
+        old_mode = self._protocol_mode
+
+        # Detect protocol and get data to parse (may be decrypted)
+        protocol, parse_data = self._detect_protocol(data, header)
+        if not protocol:
+            self._logger.warning(
+                "Unknown protocol, length: %d, header: 0x%04X", len(data), header
+            )
+            return
+
+        self._protocol_mode = protocol.protocol_mode
+        self._protocol = protocol
+
+        # Parse
+        try:
+            parsed = protocol.parse(parse_data)
+        except Exception as err:
+            self._logger.error("%s parse error: %s", protocol.name, err)
+            self.data.update({
+                "connected": True,
+                "running_state": 0,
+                "running_step": 0,
+                "error_code": 0,
+            })
+            self._notification_data = data
+            return
+
+        if parsed is None:
+            self.data["connected"] = True
+            self._notification_data = data
+            return
+
+        # CBFF decryption status logging
+        if parsed.pop("_cbff_decrypted", False):
+            self._logger.info(
+                "CBFF data decrypted successfully (device_sn=%s)",
+                self.address.replace(":", "").upper(),
+            )
+            # Enable V2.1 mode since decryption was needed
+            if protocol.protocol_mode == 6 and hasattr(protocol, 'set_v21_mode'):
+                if not protocol.v21_mode:
+                    self._logger.info("🔐 Enabling Sunster V2.1 encrypted mode")
+                    protocol.set_v21_mode(True)
+                self._queue_v21_handshake(protocol)
+        elif parsed.pop("_cbff_data_suspect", False):
+            proto_ver = parsed.pop("cbff_protocol_version", "?")
+            self._logger.warning(
+                "CBFF data appears encrypted or corrupt (protocol_version=%s, "
+                "raw=%s). Sensor values discarded — only connection state kept. "
+                "Please report this on GitHub Issue #24 with your heater model.",
+                proto_ver, data.hex(),
+            )
+
+        self.data.update(parsed)
+
+        # Beta.34: Keep temperatures in native unit (no F→C conversion for Hcalory)
+        # (@Xev analysis, issue #43: Double conversions cause precision loss and 97°F bug)
+        # When heater uses Fahrenheit, climate entity will work in °F natively
+        if self._protocol_mode == 7 and parsed.get("temp_unit") == 0:
+            # Heater uses Celsius - clamp set_temp to valid range (0-40°C)
+            if "set_temp" in parsed and parsed["set_temp"] is not None:
+                self.data["set_temp"] = max(0, min(40, parsed["set_temp"]))
+        elif self._protocol_mode == 7 and parsed.get("temp_unit") == 1:
+            # Heater uses Fahrenheit - clamp set_temp to valid range (32-104°F)
+            if "set_temp" in parsed and parsed["set_temp"] is not None:
+                self.data["set_temp"] = max(32, min(104, parsed["set_temp"]))
+            self._logger.debug(
+                "Hcalory Fahrenheit mode: temps in native °F (case=%s, cab=%s, set=%s)",
+                parsed.get("case_temperature"), parsed.get("cab_temperature"), parsed.get("set_temp")
+            )
+
+        # Hcalory set_value memory: restore last known values when heater is OFF
+        # (@Xev's discovery, issue #34: Hcalory returns set_value=None when OFF)
+        if self._protocol_mode == 7 and parsed.get("hcalory_set_value_none"):
+            # Heater is OFF - restore last known values
+            if self._hcalory_last_set_temp is not None:
+                self.data["set_temp"] = self._hcalory_last_set_temp
+            if self._hcalory_last_set_level is not None:
+                self.data["set_level"] = self._hcalory_last_set_level
+            self._logger.debug(
+                "Hcalory OFF: restored set_temp=%s, set_level=%s",
+                self._hcalory_last_set_temp, self._hcalory_last_set_level
+            )
+        elif self._protocol_mode == 7 and not parsed.get("hcalory_set_value_none"):
+            # Heater is ON - remember current values
+            if "set_temp" in parsed and parsed["set_temp"] is not None:
+                self._hcalory_last_set_temp = parsed["set_temp"]
+            if "set_level" in parsed and parsed["set_level"] is not None:
+                self._hcalory_last_set_level = parsed["set_level"]
+            self._logger.debug(
+                "Hcalory ON: remembered set_temp=%s, set_level=%s",
+                self._hcalory_last_set_temp, self._hcalory_last_set_level
+            )
+
+        # Update coordinator state from parsed data
+        if "temp_unit" in parsed:
+            if self._force_temp_unit == FORCE_TEMP_UNIT_CELSIUS:
+                self._heater_uses_fahrenheit = False
+            elif self._force_temp_unit == FORCE_TEMP_UNIT_FAHRENHEIT:
+                self._heater_uses_fahrenheit = True
+            else:
+                self._heater_uses_fahrenheit = (parsed["temp_unit"] == 1)
+            # Sync Fahrenheit flag to Hcalory protocol handler for correct command building
+            if self._protocol_mode in (7, 8) and self._protocol and hasattr(self._protocol, "_uses_fahrenheit"):
+                self._protocol._uses_fahrenheit = self._heater_uses_fahrenheit
+
+        # Apply temperature calibration (ABBA handles it internally)
+        if protocol.needs_calibration:
+            self._apply_ui_temperature_offset()
+
+        self._logger.debug("Parsed %s: %s", protocol.name, parsed)
+        self._notification_data = data
+
+        # Log protocol change
+        if old_mode != self._protocol_mode:
+            self._logger.info(
+                "Protocol mode changed: %d -> %d (%s)",
+                old_mode, self._protocol_mode, protocol.name
+            )
+
+        # Soot/pending from this parse, then sync any live cycle with ECU cooldown.
+        self._burnoff.observe_status()
+        self._burnoff.schedule_abort_if_ecu_stopped()
+
+    def _apply_ui_temperature_offset(self) -> None:
+        """Apply HA-side UI temperature offset (display only, not sent to heater).
+
+        Two purposes:
+        1. Calculate cab_temperature_raw — the true sensor value before the
+           heater's BLE offset. Needed by _async_calculate_auto_offset().
+        2. Apply the manual HA-side display offset (CONF_TEMPERATURE_OFFSET)
+           from the integration config. This only affects what HA displays,
+           it does NOT send anything to the heater.
+
+        Note: The heater's own BLE offset (cmd 20) is handled by the heater
+        itself; we only read it from byte 34 of the response.
+
+        Not called for ABBA protocol (sets cab_temperature_raw directly).
+        """
+        # Get reported temperature (already set by protocol parser)
+        # This is AFTER the heater's internal offset has been applied
+        reported_temp = self.data.get("cab_temperature")
+        if reported_temp is None:
+            return
+
+        # Calculate the TRUE raw sensor temperature (before heater's internal offset)
+        # Formula: raw_sensor_temp = reported_temp - heater_offset
+        # Example: reported=18°C, heater_offset=-2°C → raw_sensor=18-(-2)=20°C
+        heater_offset = self.data.get("heater_offset", 0)
+        raw_sensor_temp = reported_temp - heater_offset
+        self.data["cab_temperature_raw"] = raw_sensor_temp
+
+        # Get configured manual offset (default to 0.0 if not set)
+        # This is an HA-side display offset, separate from the heater offset
+        manual_offset = self.config_entry.data.get(CONF_TEMPERATURE_OFFSET, DEFAULT_TEMPERATURE_OFFSET)
+
+        # Apply manual offset for display purposes
+        if manual_offset != 0.0:
+            calibrated_temp = reported_temp + manual_offset
+
+            # Clamp to sensor range
+            calibrated_temp = max(SENSOR_TEMP_MIN, min(SENSOR_TEMP_MAX, calibrated_temp))
+
+            # Round to 1 decimal place
+            calibrated_temp = round(calibrated_temp, 1)
+
+            # Update data with calibrated value
+            self.data["cab_temperature"] = calibrated_temp
+
+            self._logger.debug(
+                "Applied HA display offset: reported=%s°C, ha_offset=%s°C, display=%s°C, raw_sensor=%s°C (heater_offset=%s°C)",
+                reported_temp, manual_offset, calibrated_temp, raw_sensor_temp, heater_offset
+            )
+
+        # Note: heater_offset is now read from byte 34 of the response,
+        # so we don't overwrite it here. It shows what the heater reports.
+
+    async def _cleanup_connection(self) -> None:
+        """Clean up BLE connection properly."""
+        if self._client:
+            try:
+                if self._client.is_connected:
+                    # Stop notifications using the active UUID
+                    if self._characteristic and self._active_char_uuid and (
+                        "notify" in self._characteristic.properties
+                        or "indicate" in self._characteristic.properties
+                    ):
+                        try:
+                            await self._client.stop_notify(self._active_char_uuid)
+                            self._logger.debug("Stopped notifications on %s", self._active_char_uuid)
+                        except Exception as err:
+                            self._logger.debug("Could not stop notifications: %s", err)
+
+                    # Disconnect
+                    await self._client.disconnect()
+                    self._logger.debug("Disconnected from heater")
+            except Exception as err:
+                self._logger.debug("Error during cleanup: %s", err)
+            finally:
+                self._client = None
+                self._characteristic = None
+                self._active_char_uuid = None
+                # Reset Hcalory MVP2 password state on disconnect
+                if self._protocol and hasattr(self._protocol, 'reset_password_state'):
+                    self._protocol.reset_password_state()
+                # Reset V2.1 handshake state on reconnect
+                self._v21_handshake_sent = False
+                # Reset time sync flag to trigger auto-sync on next connection
+                self._time_synced_this_session = False
+
+    async def _async_password_handshake(self, max_retries: int = 3) -> bool:
+        """Send password handshake with retry logic (@Xev optimizations, issue #34).
+
+        Args:
+            max_retries: Maximum number of retry attempts (default 3)
+
+        Returns:
+            True if authenticated successfully, False otherwise
+
+        Per @Xev analysis:
+        - Timeout: 0.3s (Android app completes in ~1.5s, so 0.3s per attempt is reasonable)
+        - Retry: Up to max_retries attempts if timeout or auth_byte != 0x01
+        - Auth byte check: Byte 15 should be 0x01 for successful authentication
+        """
+        if not (self._protocol and
+                hasattr(self._protocol, 'needs_password_handshake') and
+                self._protocol.needs_password_handshake):
+            return True  # Not needed for this protocol
+
+        password_packet = self._protocol.build_password_handshake(self._passkey)
+        handshake_timeout = 0.3  # seconds (@Xev: app completes in ~1.5s, 0.3s per attempt)
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                self._logger.info(
+                    "🔑 Sending MVP2 password handshake (attempt %d/%d): %s (PIN=%d)",
+                    attempt, max_retries, password_packet.hex(), self._passkey
+                )
+
+                # Clear notification buffer before sending password
+                self._notification_data = None
+                await self._write_gatt(password_packet)
+
+                # Wait for handshake response 0B0C (header 0x0003)
+                # Format: 00-03-00-01-00-01-00-0B-0C-00-00-06-01-[password]-[auth]-[checksum]
+                # Auth byte (position 15): 0x00 = unauthenticated, 0x01 = authenticated
+                iterations = int(handshake_timeout / 0.05)  # Check every 50ms
+                handshake_received = False
+                auth_byte = None
+
+                for i in range(iterations):
+                    await asyncio.sleep(0.05)
+                    # Beta.32: Need at least 17 bytes (0-16) to read auth byte at position 16
+                    if self._notification_data and len(self._notification_data) >= 17:
+                        # Check for response header 0x0003 and command 0x0B0C
+                        # Format: 00 03 00 01 00 01 00 0b 0c 00 00 06 01 [password] [authenticated] [checksum]
+                        header = (self._notification_data[0] << 8) | self._notification_data[1]
+                        # Beta.32 fix: Command is at byte 7-8, not 6-7 (@Xev, issue #34)
+                        cmd = (self._notification_data[7] << 8) | self._notification_data[8]
+
+                        if header == 0x0003 and cmd == 0x0B0C:
+                            # Parse authentication status (@Xev discovery, issue #34)
+                            # Beta.32 fix: Auth byte is at position 16 (after 4 password bytes at 12-15)
+                            auth_byte = self._notification_data[16] if len(self._notification_data) > 16 else 0xFF
+                            auth_status = "authenticated ✅" if auth_byte == 0x01 else "unauthenticated ❌" if auth_byte == 0x00 else f"unknown (0x{auth_byte:02X})"
+
+                            self._logger.info(
+                                "✅ MVP2 password handshake ACK received after %.2fs - Status: %s",
+                                i * 0.05, auth_status
+                            )
+                            handshake_received = True
+                            break
+
+                # Check if authenticated successfully
+                if handshake_received and auth_byte == 0x01:
+                    self._protocol.mark_password_sent()
+                    self._logger.info("✅ MVP2 authenticated successfully!")
+                    return True
+
+                # Not authenticated - log and retry
+                if not handshake_received:
+                    self._logger.warning(
+                        "⚠️ MVP2 password handshake timeout after %.2fs (attempt %d/%d)",
+                        handshake_timeout, attempt, max_retries
+                    )
+                elif auth_byte != 0x01:
+                    self._logger.warning(
+                        "⚠️ MVP2 authentication failed: auth_byte=0x%02X (attempt %d/%d)",
+                        auth_byte if auth_byte is not None else 0xFF, attempt, max_retries
+                    )
+
+                # Wait a bit before retry (except on last attempt)
+                if attempt < max_retries:
+                    await asyncio.sleep(0.1)
+
+            except Exception as err:
+                self._logger.warning(
+                    "⚠️ MVP2 password handshake exception (attempt %d/%d): %s",
+                    attempt, max_retries, err
+                )
+                if attempt < max_retries:
+                    await asyncio.sleep(0.1)
+
+        # All retries exhausted
+        self._logger.error("❌ MVP2 password handshake failed after %d attempts", max_retries)
+        return False
+
+    def _queue_v21_handshake(self, protocol: HeaterProtocol) -> None:
+        """Queue the required Sunster V2.1 handshake once per connection."""
+        if self._v21_handshake_sent or not hasattr(protocol, "build_handshake"):
+            return
+
+        try:
+            handshake_pkt = protocol.build_handshake(self._passkey)
+        except Exception as err:
+            self._logger.warning("Failed to build V2.1 handshake: %s", err)
+            return
+
+        self._v21_handshake_sent = True
+        self._logger.info("🔑 Sending Sunster V2.1 handshake (PIN=%d)...", self._passkey)
+        asyncio.create_task(self._send_v21_handshake(handshake_pkt))
+
+    async def _send_v21_handshake(self, packet: bytearray) -> None:
+        """Send Sunster V2.1 handshake packet asynchronously."""
+        try:
+            await asyncio.sleep(0.2)  # Brief delay after AA77 received
+            await self._write_gatt(packet)
+            self._v21_handshake_sent = True
+            self._logger.info(
+                "✅ Sunster V2.1 handshake sent: %s",
+                packet.hex()
+            )
+        except Exception as err:
+            self._v21_handshake_sent = False
+            self._logger.warning("⚠️ V2.1 handshake failed: %s", err)
+
+    async def _write_gatt(self, packet: bytearray) -> None:
+        """Write a packet to the appropriate BLE characteristic.
+
+        Uses response=False to avoid authorization issues with BLE
+        proxies (e.g., ESPHome BLE proxy). The heater sends a notification as response.
+        """
+        if getattr(self, "_is_cronus_device", False) and getattr(self, "_cronus_write_char", None):
+            write_char = self._cronus_write_char
+            char_uuid = write_char.uuid
+            protocol_name = "Webasto Cronus"
+        elif getattr(self, "_is_heatgenie_device", False) and getattr(self, "_heatgenie_write_char", None):
+            write_char = self._heatgenie_write_char
+            char_uuid = write_char.uuid
+            protocol_name = "HeatGenie"
+        elif self._is_hcalory_device and self._hcalory_write_char:
+            write_char = self._hcalory_write_char
+            char_uuid = write_char.uuid
+            protocol_name = "Hcalory"
+        elif self._is_abba_device and self._abba_write_char:
+            write_char = self._abba_write_char
+            char_uuid = write_char.uuid
+            protocol_name = "ABBA"
+        else:
+            write_char = self._characteristic
+            char_uuid = write_char.uuid if write_char else "unknown"
+            protocol_name = "Vevor/Sunster"
+
+        await self._client.write_gatt_char(write_char, packet, response=False)
+        self._logger.info(
+            "📤 Sent %d bytes to %s (char %s): %s",
+            len(packet), protocol_name, char_uuid[-4:], packet.hex()
+        )
+
+    async def _send_wake_up_ping(self) -> None:
+        """Send a wake-up ping to the device to ensure it's responsive."""
+        try:
+            if self._client and (self._characteristic or self._abba_write_char or self._hcalory_write_char or self._heatgenie_write_char):
+                packet = self._build_command_packet(1)
+                await self._write_gatt(packet)
+                await asyncio.sleep(0.5)
+                self._logger.debug("Wake-up ping sent")
+        except Exception as err:
+            self._logger.debug("Wake-up ping failed (non-critical): %s", err)
+
+    def _build_command_packet(self, command: int, argument: int = 0) -> bytearray:
+        """Build command packet for the heater.
+
+        Delegates to the active protocol's command builder.
+        Falls back to Hcalory if _is_hcalory_device, ABBA if _is_abba_device, else AA55.
+        """
+        if self._protocol:
+            protocol = self._protocol
+        elif self._is_hcalory_device:
+            protocol = self._protocols[7]
+        elif self._is_abba_device:
+            protocol = self._protocols[5]
+        else:
+            protocol = self._protocols[1]
+        packet = protocol.build_command(command, argument, self._passkey)
+        self._logger.debug(
+            "Command packet (%d bytes, %s): %s", len(packet), protocol.name, packet.hex()
+        )
+        return packet
+
+    @staticmethod
+    def _neo_packet(opcode: int, run_type: int, target: int, altitude: int) -> bytearray:
+        """Build a Sunster Neo control packet with CRC16/MODBUS."""
+        packet = bytearray((0xA5, 0x09, 0x01, opcode, run_type, target))
+        packet.extend(altitude.to_bytes(2, "big"))
+        packet.append(1)
+        crc = 0xFFFF
+        for value in packet:
+            crc ^= value
+            for _ in range(8):
+                crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
+        packet.extend(crc.to_bytes(2, "big"))
+        return packet
+
+    def _neo_control_settings(
+        self, use_startup_defaults: bool = False
+    ) -> tuple[int, int, int] | None:
+        """Return controller settings required for a Neo packet."""
+        if use_startup_defaults:
+            run_type = self.data.get("neo_run_type")
+            if run_type is None:
+                run_type = 1
+            target = self.data.get("set_temp")
+            if target is None:
+                target = 8
+            altitude = self.data.get("altitude")
+            if altitude is None:
+                altitude = 1
+        else:
+            run_type = self.data.get("neo_run_type")
+            target = self.data.get("set_temp")
+            altitude = self.data.get("altitude")
+            if self.data.get("neo_raw_state") is None:
+                self._logger.warning("DZ06 Neo control blocked until first 5A25 status frame")
+                return None
+        try:
+            run_type = int(run_type)
+            target = int(round(float(target)))
+            altitude = int(altitude)
+        except (TypeError, ValueError):
+            return None
+        minimum = self.data.get("neo_min_target")
+        maximum = self.data.get("neo_max_target")
+        try:
+            minimum = int(minimum) if minimum is not None else 8
+            maximum = int(maximum) if maximum is not None else 36
+        except (TypeError, ValueError):
+            return None
+        if (
+            run_type not in (1, 2)
+            or minimum > maximum
+            or not minimum <= target <= maximum
+            or not 0 <= altitude <= 0xFFFF
+        ):
+            return None
+        return run_type, target, altitude
+
+    async def _async_set_dz06_neo_level(self, level: int) -> bool:
+        """Set a Neo Level setpoint using the app's 0x51 big-endian CRC."""
+        if type(level) is not int or not 1 <= level <= 10:
+            raise ValueError("DZ06 Neo level must be an integer from 1 to 10")
+        settings = self._neo_control_settings()
+        if settings is None:
+            return False
+        run_type, _, altitude = settings
+        if run_type != 1:
+            self._logger.warning("DZ06 Neo level change requires Level mode")
+            return False
+        minimum = self.data.get("neo_min_target")
+        maximum = self.data.get("neo_max_target")
+        target = 8 + 3 * (level - 1)
+        if (
+            type(minimum) is not int or type(maximum) is not int
+            or not minimum <= target <= maximum
+        ):
+            self._logger.warning("DZ06 Neo level target requires confirmed valid limits")
+            return False
+        if not self._client or not self._client.is_connected:
+            return False
+        # Encode this command exactly as Neo's getCRC()/intToTwoBytes().
+        # Do not change the shared generator or existing status/power commands.
+        packet = self._neo_packet(0x51, run_type, target, altitude)
+        crc = 0xFFFF
+        for value in packet[:-2]:
+            crc ^= value
+            for _ in range(8):
+                crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
+        packet[-2:] = crc.to_bytes(2, "big")
+        self._notification_data = None
+        try:
+            await self._write_gatt(packet)
+        except Exception as err:
+            self._logger.warning("DZ06 Neo level write failed: %s", err)
+            return False
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.1)
+            response = self._notification_data
+            if (
+                response is not None and len(response) == 39
+                and response[:2] == bytearray((0x5A, 0x25))
+                and response[15] == target and response[34] == run_type
+                and int.from_bytes(response[32:34], "big") == altitude
+            ):
+                self._logger.info("DZ06 Neo level %d confirmed by status", level)
+                await self.async_request_refresh()
+                return True
+        self._logger.warning("DZ06 Neo level %d not confirmed by status", level)
+        return False
+
+    async def _async_set_dz06_neo_control(
+        self, run_type: int, target: int, altitude: int
+    ) -> bool:
+        # Send Neo's app-backed control packet and await its matching status.
+        minimum = self.data.get("neo_min_target")
+        maximum = self.data.get("neo_max_target")
+        try:
+            minimum = int(minimum) if minimum is not None else 8
+            maximum = int(maximum) if maximum is not None else 36
+        except (TypeError, ValueError):
+            return False
+        if (
+            run_type not in (1, 2)
+            or not minimum <= target <= maximum
+            or not 0 <= altitude <= 0xFFFF
+        ):
+            return False
+        self._notification_data = None
+        try:
+            await self._write_gatt(self._neo_packet(0x51, run_type, target, altitude))
+        except Exception as err:
+            self._logger.warning("DZ06 Neo control write failed: %s", err)
+            return False
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.1)
+            response = self._notification_data
+            if response is None:
+                continue
+            if (
+                len(response) == 39
+                and response[:2] == bytearray((0x5A, 0x25))
+                and response[15] == target
+                and response[34] == run_type
+            ):
+                await self.async_request_refresh()
+                return True
+            self._notification_data = None
+        return False
+
+    async def _send_dz06_neo_auth(self) -> bool:
+        """Read Neo configuration using its configured connection password."""
+        now = dt_util.now()
+        timestamp = int(now.timestamp()) + int((now.utcoffset() or timedelta()).total_seconds())
+        packet = bytearray((0x29, 0x0D, 0x5C, 0))
+        packet.extend(timestamp.to_bytes(4, "big"))
+        try:
+            password = int(self._neo_password)
+        except (TypeError, ValueError):
+            return False
+        if not 0 <= password <= 0x7FFFFFFF:
+            return False
+        packet.extend(password.to_bytes(4, "big"))
+        packet.append(1)
+        crc = 0xFFFF
+        for value in packet:
+            crc ^= value
+            for _ in range(8):
+                crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
+        packet.extend(crc.to_bytes(2, "big"))
+        self._notification_data = None
+        await self._write_gatt(packet)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.1)
+            response = self._notification_data
+            if response and len(response) == 24 and response[:2] == bytearray((0x5C, 0x16)):
+                return True
+        return False
+
+    async def _send_command(self, command: int, argument: int, timeout: float = 5.0, max_retries: int = 1) -> bool:
+        """Send command to heater with retry logic (@Xev optimizations, issue #34).
+
+        Args:
+            command: Command code (1=status, 2=mode, 3=on/off, 4=level/temp, etc.)
+            argument: Command argument
+            timeout: Timeout in seconds for waiting response (per attempt)
+            max_retries: Maximum number of retry attempts (default 1 = no retry)
+
+        For Hcalory MVP2:
+            - Timeout reduced to 0.5s (from 5s) per @Xev analysis
+            - Retry 2-3 times if no response
+            - Android app completes commands in ~1.5s total
+        """
+        # Optimize timeout and retries for Hcalory (@Xev: 5s too slow)
+        if self._protocol_mode == 7:
+            timeout = 0.5  # seconds (@Xev: app completes in ~1.5s, 0.5s per attempt)
+            if max_retries == 1:  # If caller didn't specify, use default for Hcalory
+                max_retries = 3  # Retry up to 3 times for stability
+        if not self._client or not self._client.is_connected:
+            self._logger.info(
+                "Cannot send command: heater not connected. "
+                "The integration will attempt to reconnect automatically."
+            )
+            return False
+
+        if not self._characteristic:
+            self._logger.error(
+                "Cannot send command: BLE characteristic not found. "
+                "Try reloading the integration."
+            )
+            return False
+
+        if self.is_dz06_neo:
+            if command == 1:
+                settings = self._neo_control_settings(use_startup_defaults=True)
+                if settings is None:
+                    return False
+                packet = self._neo_packet(0x00, *settings)
+                self._notification_data = None
+                try:
+                    await self._write_gatt(packet)
+                except Exception as err:
+                    self._logger.warning("DZ06 Neo status poll failed: %s", err)
+                    return False
+                deadline = time.monotonic() + timeout
+                while time.monotonic() < deadline:
+                    await asyncio.sleep(0.1)
+                    if (
+                        self._notification_data
+                        and len(self._notification_data) == 39
+                        and self._notification_data[:2] == bytearray((0x5A, 0x25))
+                    ):
+                        return True
+                    if self._notification_data:
+                        self._notification_data = None
+                return False
+            self._logger.warning("DZ06 Neo safety: blocking unimplemented legacy command cmd=%d", command)
+            return False
+
+        # For Hcalory MVP2: send password handshake if not yet done
+        if (self._protocol and
+            hasattr(self._protocol, 'needs_password_handshake') and
+            self._protocol.needs_password_handshake):
+            # Use optimized handshake with retry (@Xev: 0.3s timeout, 3 retries)
+            auth_success = await self._async_password_handshake(max_retries=3)
+
+            if auth_success:
+                # Auto-sync time on reconnect (feature request from @Wheemer, issue #38)
+                # Wait briefly to let heater initialize after handshake (fix for #38: 1hr offset bug)
+                if not self._time_synced_this_session:
+                    try:
+                        await asyncio.sleep(0.5)  # Give heater time to initialize
+                        await self.async_sync_time()
+                        self._time_synced_this_session = True
+                    except Exception as sync_err:
+                        self._logger.debug("Auto time sync failed (non-critical): %s", sync_err)
+
+                # CRITICAL FIX: For Hcalory MVP2 status queries (command=1),
+                # the heater broadcasts status automatically every ~2 seconds.
+                # Do NOT send query command - just wait for automatic notifications.
+                # Ref: Wireshark analysis from issue #34
+                if command == 1:
+                    self._logger.info(
+                        "✅ MVP2 authenticated - waiting for automatic status broadcasts "
+                        "(no query needed, heater transmits every ~2s)"
+                    )
+                    return True
+            else:
+                self._logger.warning("⚠️ MVP2 authentication failed after retries, but continuing anyway")
+                # Continue anyway - some devices might not require it
+
+        # Retry loop for command sending (@Xev: retry on timeout)
+        for attempt in range(1, max_retries + 1):
+            # Build protocol-aware command packet
+            packet = self._build_command_packet(command, argument)
+
+            if max_retries > 1:
+                self._logger.info(
+                    "📤 Sending command (attempt %d/%d): %s (cmd=%d, arg=%d, protocol=%d, timeout=%.1fs)",
+                    attempt, max_retries, packet.hex(), command, argument, self._protocol_mode, timeout
+                )
+            else:
+                self._logger.info(
+                    "📤 Sending command: %s (cmd=%d, arg=%d, protocol=%d, len=%d)",
+                    packet.hex(), command, argument, self._protocol_mode, len(packet)
+                )
+
+            try:
+                self._notification_data = None
+
+                await self._write_gatt(packet)
+
+                # For protocols that need it (e.g. ABBA), send a follow-up status request
+                if self._protocol and self._protocol.needs_post_status and command != 1:
+                    await asyncio.sleep(0.5)
+                    status_packet = self._protocol.build_command(1, 0, self._passkey)
+                    await self._write_gatt(status_packet)
+                    self._logger.debug("%s: Sent follow-up status request", self._protocol.name)
+
+                # Wait for notification with configurable timeout
+                # Hcalory: 0.5s per @Xev, others: 5s default
+                iterations = int(timeout / 0.05)  # Check every 50ms for faster response detection
+                for i in range(iterations):
+                    await asyncio.sleep(0.05)
+                    if self._notification_data:
+                        self._logger.info(
+                            "✅ Received response after %.2fs (protocol=%d%s)",
+                            i * 0.05, self._protocol_mode,
+                            f", attempt {attempt}/{max_retries}" if max_retries > 1 else ""
+                        )
+                        return True
+
+                # No response received - retry or fail
+                if attempt < max_retries:
+                    self._logger.warning(
+                        "⚠️ No response after %.1fs, retrying (%d/%d)...",
+                        timeout, attempt, max_retries
+                    )
+                    await asyncio.sleep(0.1)  # Brief pause before retry
+                else:
+                    self._logger.info("No response received after %.1fs (%d attempts total)", timeout, max_retries)
+                    return False
+
+            except Exception as err:
+                if attempt < max_retries:
+                    self._logger.warning(
+                        "⚠️ Error sending command (attempt %d/%d): %s - Retrying...",
+                        attempt, max_retries, err
+                    )
+                    await asyncio.sleep(0.1)  # Brief pause before retry
+                else:
+                    self._logger.error("❌ Error sending command after %d attempts: %s", max_retries, err)
+                    # On write error, the connection might be dead
+                    await self._cleanup_connection()
+                    return False
+
+        # Should not reach here, but just in case
+        return False
+
+    @property
+    def burnoff_enabled(self) -> bool:
+        """Return whether automatic burn-off (in-run and dirty Off) is enabled."""
+        return bool(
+            self.config_entry.data.get(CONF_BURNOFF_ENABLED, DEFAULT_BURNOFF_ENABLED)
+        )
+
+    @property
+    def burnoff_duration_minutes(self) -> int:
+        """Return configured burn-off duration in minutes."""
+        try:
+            value = int(
+                self.config_entry.data.get(
+                    CONF_BURNOFF_DURATION, DEFAULT_BURNOFF_DURATION
+                )
+            )
+        except (TypeError, ValueError):
+            value = DEFAULT_BURNOFF_DURATION
+        return max(MIN_BURNOFF_DURATION, min(MAX_BURNOFF_DURATION, value))
+
+    @property
+    def burnoff_after_cycles(self) -> int:
+        """Return in-run burn-off cycle threshold (0 = disabled)."""
+        try:
+            value = int(
+                self.config_entry.data.get(
+                    CONF_BURNOFF_AFTER_CYCLES, DEFAULT_BURNOFF_AFTER_CYCLES
+                )
+            )
+        except (TypeError, ValueError):
+            value = DEFAULT_BURNOFF_AFTER_CYCLES
+        return max(MIN_BURNOFF_AFTER_CYCLES, min(MAX_BURNOFF_AFTER_CYCLES, value))
+
+    @property
+    def burnoff_after_hours(self) -> int:
+        """Return in-run burn-off hours threshold (0 = disabled)."""
+        try:
+            value = int(
+                self.config_entry.data.get(
+                    CONF_BURNOFF_AFTER_HOURS, DEFAULT_BURNOFF_AFTER_HOURS
+                )
+            )
+        except (TypeError, ValueError):
+            value = DEFAULT_BURNOFF_AFTER_HOURS
+        return max(MIN_BURNOFF_AFTER_HOURS, min(MAX_BURNOFF_AFTER_HOURS, value))
+
+    @property
+    def burnoff_active(self) -> bool:
+        """Return whether a burn-off cycle is currently running or restoring."""
+        return self._burnoff.active
+
+    @property
+    def burnoff_pending(self) -> bool:
+        """Return whether in-run burn-off will start on the next RUNNING step."""
+        return self._burnoff.pending
+
+    @property
+    def burnoff_remaining_seconds(self) -> int | None:
+        """Return remaining burn-off time in seconds, or None if inactive."""
+        return self._burnoff.remaining_seconds
+
+    @property
+    def burnoff_cycles_since(self) -> int:
+        """Return controller heat cycles since the last successful burn-off."""
+        return self._burnoff.accumulator.cycles
+
+    @property
+    def burnoff_hours_since(self) -> float:
+        """Return RUNNING hours since the last successful burn-off."""
+        return self._burnoff.hours_since
+
+    async def async_set_burnoff_enabled(self, enabled: bool) -> None:
+        """Enable or disable automatic burn-off (in-run and dirty Off)."""
+        new_data = {**self.config_entry.data, CONF_BURNOFF_ENABLED: bool(enabled)}
+        self.hass.config_entries.async_update_entry(self.config_entry, data=new_data)
+        if not enabled:
+            await self._burnoff.disable()
+        self.async_set_updated_data(self.data)
+
+    async def async_set_burnoff_duration(self, minutes: int) -> None:
+        """Set burn-off duration in minutes.
+
+        Changing duration during an active cycle does not reset the current timer.
+        """
+        try:
+            value = int(minutes)
+        except (TypeError, ValueError):
+            value = DEFAULT_BURNOFF_DURATION
+        value = max(MIN_BURNOFF_DURATION, min(MAX_BURNOFF_DURATION, value))
+        new_data = {**self.config_entry.data, CONF_BURNOFF_DURATION: value}
+        self.hass.config_entries.async_update_entry(self.config_entry, data=new_data)
+        self.async_set_updated_data(self.data)
+
+    async def async_set_burnoff_after_cycles(self, cycles: int) -> None:
+        """Set the in-run burn-off cycle threshold (0 disables)."""
+        try:
+            value = int(cycles)
+        except (TypeError, ValueError):
+            value = DEFAULT_BURNOFF_AFTER_CYCLES
+        value = max(MIN_BURNOFF_AFTER_CYCLES, min(MAX_BURNOFF_AFTER_CYCLES, value))
+        new_data = {**self.config_entry.data, CONF_BURNOFF_AFTER_CYCLES: value}
+        self.hass.config_entries.async_update_entry(self.config_entry, data=new_data)
+        self.async_set_updated_data(self.data)
+        self._burnoff.maybe_start_in_run()
+
+    async def async_set_burnoff_after_hours(self, hours: int) -> None:
+        """Set the in-run burn-off hours threshold (0 disables)."""
+        try:
+            value = int(hours)
+        except (TypeError, ValueError):
+            value = DEFAULT_BURNOFF_AFTER_HOURS
+        value = max(MIN_BURNOFF_AFTER_HOURS, min(MAX_BURNOFF_AFTER_HOURS, value))
+        new_data = {**self.config_entry.data, CONF_BURNOFF_AFTER_HOURS: value}
+        self.hass.config_entries.async_update_entry(self.config_entry, data=new_data)
+        self.async_set_updated_data(self.data)
+        self._burnoff.maybe_start_in_run()
+
+    def burnoff_protocol_snapshot(self) -> dict[str, int]:
+        """Return protocol state needed to restore a burn-off snapshot."""
+        snapshot: dict[str, int] = {}
+        if self._protocol_mode == 8:
+            raw_mode = self.data.get("heatgenie_run_mode")
+            if raw_mode in (0, 1, 2):
+                snapshot["heatgenie_run_mode"] = raw_mode
+        if self.is_dz06_neo:
+            settings = self._neo_control_settings()
+            if settings is not None:
+                run_type, target, altitude = settings
+                maximum = self.data.get("neo_max_target")
+                if maximum is None:
+                    return snapshot
+                try:
+                    maximum = int(maximum)
+                except (TypeError, ValueError):
+                    return snapshot
+                snapshot.update(
+                    {
+                        "neo_max_target": maximum,
+                        "neo_run_type": run_type,
+                        "neo_target": target,
+                        "neo_altitude": altitude,
+                    }
+                )
+        return snapshot
+
+    async def async_apply_burnoff_max_power(self, cycle: Any) -> bool:
+        """Apply the app-backed maximum-power operation for this protocol."""
+        if self._protocol_mode == 8:
+            # HeatGenie's DB0_DN_SHORT_PARA uses raw mode 1 for manual heating.
+            mode_ok = bool(await self._send_command(2, 1))
+            return bool(await self.async_set_level(MAX_LEVEL)) and mode_ok
+
+        if self.is_dz06_neo:
+            snapshot = cycle.saved_protocol_state or {}
+            try:
+                int(snapshot["neo_run_type"])
+                int(snapshot["neo_target"])
+                altitude = int(snapshot["neo_altitude"])
+                maximum = int(snapshot["neo_max_target"])
+            except (KeyError, TypeError, ValueError):
+                self._logger.warning("DZ06 Neo burn-off requires a restorable status snapshot")
+                return False
+            # The app uses opcode 0x51, run type 1, at its configured upper target.
+            return await self._async_set_dz06_neo_control(1, maximum, altitude)
+
+        mode_ok = True
+        if self.data.get("running_mode") != RUNNING_MODE_LEVEL:
+            mode_ok = bool(await self.async_set_mode(RUNNING_MODE_LEVEL))
+        return bool(await self.async_set_level(MAX_LEVEL)) and mode_ok
+
+    async def async_restore_burnoff_snapshot(self, cycle: Any) -> bool:
+        """Restore the app-native mode and target captured before burn-off."""
+        mode = cycle.saved_mode
+        if mode is None:
+            return True
+
+        snapshot = cycle.saved_protocol_state or {}
+        if self.is_dz06_neo:
+            try:
+                return await self._async_set_dz06_neo_control(
+                    int(snapshot["neo_run_type"]),
+                    int(snapshot["neo_target"]),
+                    int(snapshot["neo_altitude"]),
+                )
+            except (KeyError, TypeError, ValueError):
+                self._logger.warning("DZ06 Neo burn-off snapshot is incomplete")
+                return False
+
+        if self._protocol_mode == 8:
+            raw_mode = snapshot.get("heatgenie_run_mode")
+            if raw_mode not in (0, 1, 2):
+                self._logger.warning("HeatGenie burn-off snapshot is missing raw mode")
+                return False
+            mode_ok = bool(await self._send_command(2, raw_mode))
+            if raw_mode == 1 and cycle.saved_level is not None:
+                return bool(await self.async_set_level(int(cycle.saved_level))) and mode_ok
+            if raw_mode == 0 and cycle.saved_temp is not None:
+                return bool(await self.async_set_temperature(float(cycle.saved_temp))) and mode_ok
+            return mode_ok
+
+        mode_ok = bool(await self.async_set_mode(int(mode)))
+        if mode == RUNNING_MODE_LEVEL and cycle.saved_level is not None:
+            return bool(await self.async_set_level(int(cycle.saved_level))) and mode_ok
+        if mode == RUNNING_MODE_TEMPERATURE and cycle.saved_temp is not None:
+            return bool(await self.async_set_temperature(float(cycle.saved_temp))) and mode_ok
+        return mode_ok
+
+    async def _power_off(self) -> None:
+        """Send the real power-off command."""
+        # ABBA uses a toggle command (0xA1) for both ON and OFF.
+        # Skip if already off, and never toggle during cooldown (would restart).
+        if self._protocol_mode == 5 and (
+            self.data.get("running_state", 0) == 0
+            or self.data.get("running_step") == RUNNING_STEP_COOLDOWN
+        ):
+            self._logger.info(
+                "ABBA: Heater already off or in cooldown, skipping toggle"
+            )
+            return
+
+        # Do not treat the resulting status transition as an external shutdown.
+        self._burnoff.ha_power_off = True
+        if self.is_dz06_neo:
+            success = await self._send_dz06_neo_power(False)
+            if success:
+                await self.async_request_refresh()
+            else:
+                self._burnoff.ha_power_off = False
+            return
+        success = await self._send_command(3, 0)
+        if success:
+            await self.async_request_refresh()
+        else:
+            self._burnoff.ha_power_off = False
+
+    async def async_start_burnoff(self, *, shutdown_after: bool = True) -> None:
+        """Run at max power, optionally shutting down when the timer expires.
+
+        Snapshots the current running mode and setpoint so they can be restored
+        before power-off (or when burn-off is cancelled).
+        """
+        await self._burnoff.start(shutdown_after=shutdown_after)
+
+    async def async_run_burnoff(self) -> None:
+        """Run a max-power burn-off without shutting down afterwards."""
+        await self.async_start_burnoff(shutdown_after=False)
+
+    async def async_power_off_now(self) -> None:
+        """Skip burn-off and power off immediately."""
+        await self.async_turn_off(immediate=True)
+
+    async def _send_dz06_neo_power(self, turn_on: bool) -> bool:
+        """Send and confirm a captured Neo ON/OFF command."""
+        if not self.is_dz06_neo:
+            return False
+        settings = self._neo_control_settings()
+        if settings is None:
+            return False
+        run_type, target, altitude = settings
+        self._notification_data = None
+        try:
+            await self._write_gatt(
+                self._neo_packet(0x5A if turn_on else 0x5C, run_type, target, altitude)
+            )
+        except Exception as err:
+            self._logger.warning("DZ06 Neo power write failed: %s", err)
+            return False
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.1)
+            response = self._notification_data
+            if response is None:
+                continue
+            if len(response) == 39 and response[:2] == bytearray((0x5A, 0x25)):
+                raw_state = response[3]
+                if raw_state in (1, 2, 4, 5):
+                    return turn_on
+                if raw_state in (0, 7, 8):
+                    return not turn_on
+                return False
+            self._notification_data = None
+        return False
+
+    async def async_turn_on(self) -> None:
+        """Turn heater on."""
+        if self._protocol_mode == 9:
+            if await self._async_write_cronus_record("power", bytes((1, 1))):
+                await self.async_request_refresh()
+            return
+        if self.is_dz06_neo:
+            await self._burnoff.cancel(restore=False)
+            if await self._send_dz06_neo_power(True):
+                await self.async_request_refresh()
+            return
+        await self._burnoff.cancel(restore=True)
+        # ABBA uses a toggle command (0xA1) for both ON and OFF.
+        # Guard against accidental toggle while already running or cooling down.
+        if self._protocol_mode == 5:
+            if self.data.get("running_step") == RUNNING_STEP_COOLDOWN:
+                self._logger.info("ABBA: Heater is cooling down, skipping toggle command")
+                return
+            if self.data.get("running_state", 0) == 1:
+                self._logger.info("ABBA: Heater already on, skipping toggle command")
+                return
+        success = await self._send_command(3, 1)
+        if success:
+            await self.async_request_refresh()
+
+    async def async_turn_off(self, *, immediate: bool = False) -> None:
+        """Turn heater off.
+
+        By default, when burn-off is enabled, this switches to max power for the
+        configured duration, restores the previous heating mode, then sends the
+        real power-off command. Pass immediate=True to skip burn-off.
+        """
+        if self._protocol_mode == 9:
+            if await self._async_write_cronus_record("power", bytes((1, 0))):
+                await self.async_request_refresh()
+            return
+        if immediate:
+            # Power Off Now: skip burn-off now and do not pending on the Off edge.
+            self._burnoff.skip_pending_on_off = True
+            await self._burnoff.cancel(restore=True)
+            if not self._burnoff.ecu_shutdown_observed():
+                await self._power_off()
+            return
+
+        if self._burnoff.active:
+            if (
+                self._burnoff.cycle.phase == BurnoffPhase.RESTORING
+                or self._burnoff.ecu_shutdown_observed()
+            ):
+                # Restore only; sending Off while cooling can ABBA-toggle back on.
+                await self._burnoff.cancel(restore=True)
+                return
+            # Second Off during a live cycle: skip remaining time and power off.
+            await self.async_turn_off(immediate=True)
+            return
+
+        # ABBA uses a toggle command (0xA1) for both ON and OFF.
+        # Guard against accidental toggle: skip if already off.
+        if self._protocol_mode == 5 and self.data.get("running_state", 0) == 0:
+            self._logger.info("ABBA: Heater already off, skipping toggle command")
+            return
+
+        if self._burnoff.should_run_before_shutdown():
+            await self.async_start_burnoff(shutdown_after=True)
+            return
+
+        await self._power_off()
+
+    async def async_set_level(self, level: int) -> None:
+        """Set heater level (1-10).
+
+        CRITICAL FIX (issue #43, @Xev analysis):
+        - Hcalory uses SEPARATE commands: cmd 5 for level, cmd 4 for temperature
+        - AAXX protocols use SAME command (cmd 4) for both level and temperature
+        """
+        if self._protocol_mode == 9:
+            if self.data.get("cronus_controller_type") != "air":
+                self._logger.warning("Cronus water controllers do not expose an air level")
+                return
+            if self.data.get("cronus_mode") != "ventilation":
+                self._logger.warning("Cronus air level is available only in ventilation mode")
+                return
+            level = max(1, min(4, level))
+            if await self._async_write_cronus_record("air_level", bytes((level,))):
+                await self.async_request_refresh()
+            return
+
+        if self._burnoff.active and not self._burnoff.cycle.applying:
+            self._logger.info("Ignoring level change during burn-off")
+            return False
+
+        if self.is_dz06_neo:
+            return await self._async_set_dz06_neo_level(level)
+
+        level = max(1, min(10, level))
+        if self._protocol_mode == 5:  # ABBA/HeaterCC uses level up/down button commands
+            current_level_raw = self.data.get("set_level")
+            try:
+                current_level = max(1, min(10, int(current_level_raw)))
+            except (TypeError, ValueError):
+                self._logger.warning("ABBA: Cannot set level without current set_level")
+                return False
+
+            diff = level - current_level
+            if diff == 0:
+                self._logger.info("ABBA: Level already %d, skipping command", level)
+                return True
+
+            step_arg = 1 if diff > 0 else -1
+            steps = abs(diff)
+            self._logger.info(
+                "SET LEVEL REQUEST: level=%d, current=%d, protocol=5 (cmd=5, steps=%d)",
+                level, current_level, steps
+            )
+
+            success = True
+            for index in range(steps):
+                success = await self._send_command(5, step_arg)
+                if not success:
+                    break
+                if index < steps - 1:
+                    await asyncio.sleep(0.1)
+
+            if success:
+                await self.async_request_refresh()
+                self._logger.info("✅ SET LEVEL SUCCESS: level=%d", level)
+            else:
+                self._logger.warning("❌ SET LEVEL FAILED: level=%d", level)
+            return success
+
+        # CBFF and Hcalory use SEPARATE commands: cmd 5 for level, cmd 4 for temperature
+        # AAXX protocols use SAME command (cmd 4) for both level and temperature
+        if self._protocol_mode in (6, 7, 8):  # CBFF or Hcalory
+            command = 5
+            self._logger.info(
+                "SET LEVEL REQUEST: level=%d, protocol=%d (cmd=5)",
+                level, self._protocol_mode
+            )
+        else:  # AAXX, ABBA
+            command = 4
+            self._logger.info(
+                "SET LEVEL REQUEST: level=%d, protocol=%d (cmd=4)",
+                level, self._protocol_mode
+            )
+
+        success = await self._send_command(command, level)
+        if success:
+            await self.async_request_refresh()
+            self._logger.info("✅ SET LEVEL SUCCESS: level=%d", level)
+        else:
+            self._logger.warning("❌ SET LEVEL FAILED: level=%d", level)
+        return success
+
+    async def async_set_temperature(self, temperature: float) -> None:
+        """Set target temperature in heater's native unit (no conversions).
+
+        Beta.41 fix: Per-protocol temperature limits:
+        - Hcalory (mode 7): 0-40°C or 32-104°F
+        - AAXX protocols (modes 1-4): 8-36°C
+        - Other protocols: 8-36°C (safe default)
+        """
+        if self._burnoff.active and not self._burnoff.cycle.applying:
+            self._logger.info("Ignoring temperature change during burn-off")
+            return False
+
+        current_temp = self.data.get("set_temp", "unknown")
+        current_mode = self.data.get("running_mode", "unknown")
+        if self._protocol_mode == 9:
+            if self.data.get("cronus_controller_type") != "air":
+                self._logger.warning("Cronus water controllers do not expose an air setpoint")
+                return
+            temperature = max(5, min(35, temperature))
+            record_name = {
+                "heating": "air_setpoint",
+                "boost": "air_setpoint_boost",
+                "eco": "air_setpoint_eco",
+            }.get(self.data.get("cronus_mode"))
+            if record_name is None:
+                self._logger.warning("Cronus ventilation mode has no temperature setpoint")
+                return
+            if await self._async_write_cronus_record(
+                record_name, bytes((round(temperature) + 50,))
+            ):
+                await self.async_request_refresh()
+            return
+
+        # Per-protocol clamping
+        if self._protocol_mode == 8:
+            if self._heater_uses_fahrenheit:
+                temperature = max(50, min(104, temperature))
+                unit_str = "°F"
+            else:
+                temperature = max(10, min(40, temperature))
+                unit_str = "°C"
+        elif self.is_dz06_neo:
+            minimum = self.data.get("neo_min_target")
+            maximum = self.data.get("neo_max_target")
+            try:
+                minimum = int(minimum) if minimum is not None else 8
+                maximum = int(maximum) if maximum is not None else 36
+            except (TypeError, ValueError):
+                return False
+            temperature = max(minimum, min(maximum, temperature))
+            unit_str = "°C"
+        elif self._heater_uses_fahrenheit:
+            temperature = max(32, min(104, temperature))
+            unit_str = "°F"
+        elif self._protocol_mode == 7:
+            temperature = max(0, min(40, temperature))
+            unit_str = "°C"
+        else:
+            temperature = max(8, min(36, temperature))
+            unit_str = "°C"
+
+        self._logger.debug(
+            "SET TEMPERATURE: target=%.1f%s, current=%s, mode=%s, protocol=%d",
+            temperature, unit_str, current_temp, current_mode, self._protocol_mode
+        )
+
+        # Convert to int for command (protocols expect integer temperatures)
+        command_temp = int(round(temperature))
+        if self.is_dz06_neo:
+            settings = self._neo_control_settings()
+            if settings is None:
+                return False
+            run_type, _, altitude = settings
+            return await self._async_set_dz06_neo_control(
+                run_type, command_temp, altitude
+            )
+        success = await self._send_command(4, command_temp)
+
+        if success:
+            await self.async_request_refresh()
+            # Log result after refresh
+            new_temp = self.data.get("set_temp", "unknown")
+            self._logger.info(
+                "🌡️ SET TEMPERATURE RESULT: requested=%.1f%s, heater_reports=%s%s, %s",
+                temperature, unit_str, new_temp, unit_str,
+                "✅ SUCCESS" if abs(new_temp - temperature) < 1 else "❌ MISMATCH"
+            )
+        else:
+            self._logger.warning("🌡️ SET TEMPERATURE FAILED: command not sent successfully")
+        return success
+
+    async def async_set_cronus_mode(self, mode_name: str) -> None:
+        """Set a controller mode exposed by ThermoConnect."""
+        controller_type = self.data.get("cronus_controller_type")
+        if self._protocol_mode != 9 or controller_type not in ("air", "water"):
+            self._logger.warning("Cronus mode is unavailable until the controller type is known")
+            return
+        mode_value = {
+            "heating": 0,
+            "ventilation": 1,
+            "boost": 2,
+            "eco": 3,
+        }.get(mode_name)
+        if mode_value is None:
+            raise ValueError(f"Unknown Cronus mode: {mode_name}")
+        if await self._async_write_cronus_record(f"{controller_type}_mode", bytes((mode_value,))):
+            await self.async_request_refresh()
+
+    async def async_set_mode(self, mode: int) -> None:
+        """Set running mode (0=Manual, 1=Level, 2=Temperature, 3=Ventilation).
+
+        Mode 3 (Ventilation) is ABBA-only and only works when heater is in standby.
+        It activates fan-only mode without heating.
+        """
+        if self._burnoff.active and not self._burnoff.cycle.applying:
+            self._logger.info("Ignoring mode change during burn-off")
+            return False
+
+        # Ventilation mode (ABBA only)
+        if mode == 3:
+            if self._protocol_mode != 5:
+                self._logger.warning("Ventilation mode is only available for ABBA devices")
+                return False
+
+            running_step = self.data.get("running_step", 0)
+            if running_step not in (0, 6):  # STANDBY or VENTILATION
+                self._logger.warning(
+                    "Ventilation mode only available when heater is off (current step: %d)",
+                    running_step
+                )
+                return False
+
+            self._logger.info("Activating ventilation mode (ABBA 0xA4)")
+            success = await self._send_command(101, 0)  # Command 101 = ventilation
+            if success:
+                await self.async_request_refresh()
+            return success
+
+        # Standard modes (0-2)
+        mode = max(0, min(2, mode))
+        self._logger.info("Setting running mode to %d", mode)
+        success = await self._send_command(2, mode)
+        if success:
+            await self.async_request_refresh()
+        return success
+
+    async def async_set_auto_start_stop(self, enabled: bool) -> None:
+        """Set Automatic Start/Stop mode (cmd 18).
+
+        When enabled in Temperature mode, the heater will completely stop
+        when the room temperature reaches 2°C above the target, and restart
+        when it drops 2°C below the target.
+        """
+        self._logger.info("Setting Auto Start/Stop to %s", "enabled" if enabled else "disabled")
+        # Command 18, arg=1 for enabled, arg=0 for disabled
+        success = await self._send_command(18, 1 if enabled else 0)
+        if success:
+            await self.async_request_refresh()
+
+    async def async_sync_time(self) -> None:
+        """Sync heater time with Home Assistant time (cmd 10).
+
+        AAXX/CBFF protocols: Time sent as 60 * hours + minutes
+        Hcalory MVP2: Time sent as HH, MM, SS, DOW bytes in query packet
+        """
+        if self.is_dz06_neo:
+            self._logger.info("DZ06 Neo: skipping legacy heater time-sync command")
+            return
+        # Beta.29 fix: Use dt_util.now() for correct local timezone (issue #38)
+        # datetime.now() uses UTC in Docker containers → 5hr offset for EST users
+        now = dt_util.now()
+
+        # Beta.31 fix: Hcalory uses HH,MM,SS,DOW format in query packet (@Xev, issue #34)
+        if self._protocol_mode == 7:
+            # For Hcalory MVP2, set custom timestamp for next query command
+            self._protocol.set_query_timestamp(now)
+        elif self._protocol_mode == 8:
+            time_value = (now.weekday() << 11) | (now.hour << 6) | now.minute
+            success = await self._send_command(10, time_value)
+            self._logger.info(
+                "Syncing Hcalory time to %02d:%02d:%02d DOW=%d",
+                now.hour, now.minute, now.second, now.isoweekday()
+            )
+            success = await self._send_command(10, 0)  # argument ignored for Hcalory
+            # Reset custom timestamp after use
+            self._protocol.set_query_timestamp(None)
+        else:
+            # AAXX/CBFF: time_value = 60 * hour + minute
+            time_value = 60 * now.hour + now.minute
+            self._logger.info("Syncing heater time to %02d:%02d (value=%d)", now.hour, now.minute, time_value)
+            success = await self._send_command(10, time_value)
+
+        if success:
+            self._logger.info("✅ Time sync successful")
+        else:
+            self._logger.warning("❌ Time sync failed")
+
+    async def async_set_heater_offset(self, offset: int) -> None:
+        """Set temperature offset on the heater (cmd 20).
+
+        This sends the offset value directly to the heater's control board.
+        The heater will then use this offset for its own temperature readings
+        and auto-start/stop logic.
+
+        Both positive and negative offsets are supported via BLE.
+        Encoding discovered by @Xev:
+        - arg1 (packet[5]) = offset % 256 (value in two's complement)
+        - arg2 (packet[6]) = (offset // 256) % 256 (0x00 for positive, 0xff for negative)
+
+        Args:
+            offset: Temperature offset in °C (-10 to +10, clamped)
+        """
+        # Clamp to valid range
+        offset = max(MIN_HEATER_OFFSET, min(MAX_HEATER_OFFSET, offset))
+
+        self._logger.info("🌡️ Setting heater temperature offset to %d°C (cmd 20)", offset)
+
+        # Command 20 for temperature offset
+        # Pass offset directly - _build_command_packet handles encoding
+        success = await self._send_command(20, offset)
+
+        if success:
+            self._current_heater_offset = offset
+            self.data["heater_offset"] = offset
+            self._logger.info("✅ Heater offset set to %d°C", offset)
+            await self.async_request_refresh()
+        else:
+            self._logger.warning("❌ Failed to set heater offset")
+
+    async def async_set_language(self, language: int) -> None:
+        """Set voice notification language (cmd 14).
+
+        Args:
+            language: Language code (0=Chinese, 1=English, 2=Russian, etc.)
+        """
+        self._logger.info("🗣️ Setting language to %d (cmd 14)", language)
+        success = await self._send_command(14, language)
+        if success:
+            self.data["language"] = language
+            self._logger.info("✅ Language set to %d", language)
+            await self.async_request_refresh()
+        else:
+            self._logger.warning("❌ Failed to set language")
+
+    async def async_set_temp_unit(self, use_fahrenheit: bool) -> None:
+        """Set temperature unit (cmd 15).
+
+        Args:
+            use_fahrenheit: True for Fahrenheit, False for Celsius
+        """
+        value = 1 if use_fahrenheit else 0
+        unit_name = "Fahrenheit" if use_fahrenheit else "Celsius"
+        self._logger.info("🌡️ Setting temperature unit to %s (cmd 15, value=%d)", unit_name, value)
+        success = await self._send_command(15, value)
+        if success:
+            self.data["temp_unit"] = value
+            self._heater_uses_fahrenheit = use_fahrenheit
+            self._logger.info("✅ Temperature unit set to %s", unit_name)
+            await self.async_request_refresh()
+        else:
+            self._logger.warning("❌ Failed to set temperature unit")
+
+    async def async_set_altitude_unit(self, use_feet: bool) -> None:
+        """Set altitude unit (cmd 19).
+
+        Args:
+            use_feet: True for Feet, False for Meters
+        """
+        value = 1 if use_feet else 0
+        unit_name = "Feet" if use_feet else "Meters"
+        self._logger.info("📏 Setting altitude unit to %s (cmd 19, value=%d)", unit_name, value)
+        success = await self._send_command(19, value)
+        if success:
+            self.data["altitude_unit"] = value
+            self._logger.info("✅ Altitude unit set to %s", unit_name)
+            await self.async_request_refresh()
+        else:
+            self._logger.warning("❌ Failed to set altitude unit")
+
+    async def async_set_high_altitude(self, enabled: bool) -> None:
+        """Toggle high altitude mode (ABBA-only, cmd 99).
+
+        The ABBA protocol uses a toggle command for high altitude mode.
+        """
+        if not self._is_abba_device:
+            self._logger.warning("High altitude mode is only available for ABBA/HeaterCC devices")
+            return
+        state_name = "ON" if enabled else "OFF"
+        self._logger.info("🏔️ Setting high altitude mode to %s", state_name)
+        success = await self._send_command(99, 0)
+        if success:
+            self.data["high_altitude"] = 1 if enabled else 0
+            self._logger.info("✅ High altitude mode set to %s", state_name)
+            await self.async_request_refresh()
+        else:
+            self._logger.warning("❌ Failed to set high altitude mode")
+
+    async def async_set_altitude_mode(self, mode: int) -> None:
+        """Set high altitude mode for Hcalory MVP2 (0=Disabled, 1=Mode 1, 2=Mode 2).
+
+        Hcalory has 3 altitude compensation modes instead of binary on/off.
+        Per @Xev analysis (issue #34): Uses toggle command cycling through states.
+
+        Cycling state machine: OFF(0) → MODE_1(1) → MODE_2(2) → OFF(0)
+
+        Args:
+            mode: Altitude mode (0=Disabled, 1=Mode 1, 2=Mode 2)
+        """
+        if self._protocol_mode != 7:
+            self._logger.warning("High altitude mode selector is only available for Hcalory MVP2 devices")
+            return
+
+        target = max(0, min(2, mode))  # Clamp to valid range
+        current = self.data.get("high_altitude", 0)
+        mode_names = {0: "Disabled", 1: "Mode 1", 2: "Mode 2"}
+
+        # Nothing to do if already at target state
+        if current == target:
+            self._logger.debug("High altitude already at %s", mode_names.get(target))
+            return
+
+        # Calculate forward steps in circular state machine (OFF→M1→M2→OFF)
+        steps = (target - current) % 3
+        self._logger.info(
+            "🏔️ Changing altitude mode from %s to %s (%d toggle commands)",
+            mode_names.get(current), mode_names.get(target), steps
+        )
+
+        # Send toggle command N times with 0.3s delay between each
+        for i in range(steps):
+            success = await self._send_command(9, 0)  # Command 9 = toggle altitude mode
+            if not success:
+                self._logger.warning("❌ Failed to send altitude toggle command %d/%d", i + 1, steps)
+                return
+            # Update local state after each successful toggle
+            current = (current + 1) % 3
+            self.data["high_altitude"] = current
+            self._logger.debug("Toggle %d/%d: now at %s", i + 1, steps, mode_names.get(current))
+            # Wait before next toggle (except on last iteration)
+            if i < steps - 1:
+                await asyncio.sleep(0.3)
+
+        self._logger.info("✅ High altitude mode set to %s", mode_names.get(target))
+        await self.async_request_refresh()
+
+    async def async_set_tank_volume(self, volume_index: int) -> None:
+        """Set tank volume by index (cmd 16).
+
+        The heater uses index-based values, not actual liters:
+        0=None, 1=5L, 2=10L, 3=15L, 4=20L, 5=25L, 6=30L, 7=35L, 8=40L, 9=45L, 10=50L
+
+        Args:
+            volume_index: Tank volume index (0-10)
+        """
+        volume_index = max(0, min(10, volume_index))
+        self._logger.info("⛽ Setting tank volume to index %d (cmd 16)", volume_index)
+        success = await self._send_command(16, volume_index)
+        if success:
+            self.data["tank_volume"] = volume_index
+            self._logger.info("✅ Tank volume set to index %d", volume_index)
+            await self.async_request_refresh()
+        else:
+            self._logger.warning("❌ Failed to set tank volume")
+
+    async def async_set_pump_type(self, pump_type: int) -> None:
+        """Set oil pump type (cmd 17).
+
+        Pump types: 0=16µl, 1=22µl, 2=28µl, 3=32µl
+
+        Args:
+            pump_type: Pump type (0-3)
+        """
+        pump_type = max(0, min(3, pump_type))
+        self._logger.info("🔧 Setting pump type to %d (cmd 17)", pump_type)
+        success = await self._send_command(17, pump_type)
+        if success:
+            self.data["pump_type"] = pump_type
+            self._logger.info("✅ Pump type set to %d", pump_type)
+            await self.async_request_refresh()
+        else:
+            self._logger.warning("❌ Failed to set pump type")
+
+    async def async_set_backlight(self, level: int) -> None:
+        """Set display backlight brightness (cmd 21).
+
+        Values: 0=Off, 1-10, 20-100 (in steps of 10).
+        The heater may round to nearest supported value.
+
+        Args:
+            level: Brightness level (0-100)
+        """
+        level = max(0, min(100, level))
+        self._logger.info("Setting backlight to %d (cmd 21)", level)
+        success = await self._send_command(21, level)
+        if success:
+            self.data["backlight"] = level
+            self._logger.info("Backlight set to %d", level)
+            await self.async_request_refresh()
+        else:
+            self._logger.warning("Failed to set backlight")
+
+    async def async_set_auto_offset_enabled(self, enabled: bool) -> None:
+        """Enable or disable automatic temperature offset adjustment.
+
+        When enabled, the integration will automatically calculate and send
+        temperature offset commands to the heater based on an external
+        temperature sensor.
+
+        Args:
+            enabled: True to enable, False to disable
+        """
+        self._logger.info("Setting auto offset to %s", "enabled" if enabled else "disabled")
+        self.data["auto_offset_enabled"] = enabled
+
+        # Persist the setting immediately
+        await self.async_save_data()
+
+        if enabled:
+            # Trigger initial calculation
+            await self._async_calculate_auto_offset()
+        else:
+            # Reset heater offset to 0 when disabling
+            if self._current_heater_offset != 0:
+                self._logger.info("Resetting heater offset to 0")
+                await self.async_set_heater_offset(0)
+
+    async def async_set_timer_enabled(self, enabled: bool) -> None:
+        """Enable or disable timer (command 13, issue #48).
+
+        Only supported on AA55/AA66 encrypted protocols.
+
+        Args:
+            enabled: True to enable timer, False to disable
+        """
+        if self._protocol_mode not in (2, 4):
+            self._logger.warning("Timer not supported on protocol mode %d", self._protocol_mode)
+            return
+
+        arg = 1 if enabled else 0
+        self._logger.info("Setting timer enabled: %s", enabled)
+        success = await self._send_command(13, arg)
+
+        if success:
+            await self.async_request_refresh()
+
+    async def async_set_timer_start(self, minutes_from_midnight: int) -> None:
+        """Set timer start time (command 11, issue #48).
+
+        Only supported on AA55/AA66 encrypted protocols.
+
+        Args:
+            minutes_from_midnight: Start time in minutes from midnight (0-1439)
+        """
+        if self._protocol_mode not in (2, 4):
+            self._logger.warning("Timer not supported on protocol mode %d", self._protocol_mode)
+            return
+
+        # Clamp to valid range
+        minutes = max(0, min(1439, minutes_from_midnight))
+        self._logger.info("Setting timer start time: %d minutes from midnight", minutes)
+        success = await self._send_command(11, minutes)
+
+        if success:
+            await self.async_request_refresh()
+
+    async def async_set_timer_duration(self, minutes: int) -> None:
+        """Set timer duration (command 12, issue #48).
+
+        Only supported on AA55/AA66 encrypted protocols.
+
+        Args:
+            minutes: Duration in minutes (0-65535, 65535 = infinite)
+        """
+        if self._protocol_mode not in (2, 4):
+            self._logger.warning("Timer not supported on protocol mode %d", self._protocol_mode)
+            return
+
+        # Clamp to valid range
+        minutes = max(0, min(65535, minutes))
+        self._logger.info("Setting timer duration: %d minutes", minutes)
+        success = await self._send_command(12, minutes)
+
+        if success:
+            await self.async_request_refresh()
+
+    async def async_send_raw_command(self, command: int, argument: int) -> bool:
+        """Send a raw command to the heater for debugging purposes.
+
+        This allows testing different command numbers to discover the correct
+        command for various heater functions.
+
+        Args:
+            command: Command number (0-255)
+            argument: Argument value (-128 to 127, encoded as two's complement)
+
+        Returns:
+            True if command was sent successfully
+        """
+        self._logger.info(
+            "🔧 DEBUG: Sending raw command: cmd=%d, arg=%d",
+            command, argument
+        )
+
+        success = await self._send_command(command, argument)
+
+        if success:
+            self._logger.info("✅ DEBUG: Raw command sent successfully")
+            await self.async_request_refresh()
+        else:
+            self._logger.warning("❌ DEBUG: Failed to send raw command")
+
+        return success
+
+    async def async_shutdown(self) -> None:
+        """Shutdown coordinator."""
+        self._logger.debug("Shutting down Vevor Heater coordinator")
+
+        # Stop the burn-off wait task; in-progress state is already persisted
+        await self._burnoff.stop_wait_task()
+
+        # Clean up external sensor listener
+        if self._auto_offset_unsub:
+            self._auto_offset_unsub()
+            self._auto_offset_unsub = None
+
+        await self._cleanup_connection()
