@@ -1753,16 +1753,22 @@ class VevorHeaterCoordinator(DataUpdateCoordinator):
             self._handle_cronus_notification(bytearray(data))
             return
 
-        # Log ALL received data for debugging
-        self._logger.info(
-            "📩 Received BLE data (%d bytes): %s",
-            len(data),
-            data.hex()
-        )
+        # A late Neo response can arrive after its transport was cleared.
+        neo_frame = data[:2] in (b"\x5c\x16", b"\x5a\x25") or data[:3] == b"\x29\x0d\x5c"
+        if neo_frame:
+            self._logger.info("Received DZ06 Neo frame (%d bytes; payload omitted)", len(data))
+        else:
+            self._logger.info(
+                "📩 Received BLE data (%d bytes): %s",
+                len(data),
+                data.hex()
+            )
         try:
             self._parse_response(data)
         except Exception as err:
-            self._logger.error("Error parsing notification: %s", err)
+            self._logger.error(
+                "Error parsing notification: %s", type(err).__name__ if neo_frame else err
+            )
 
     def _detect_protocol(
         self, data: bytearray, header: int
@@ -2031,6 +2037,7 @@ class VevorHeaterCoordinator(DataUpdateCoordinator):
 
     async def _cleanup_connection(self) -> None:
         """Clean up BLE connection properly."""
+        is_neo = self.is_dz06_neo
         if self._client:
             try:
                 if self._client.is_connected:
@@ -2043,13 +2050,17 @@ class VevorHeaterCoordinator(DataUpdateCoordinator):
                             await self._client.stop_notify(self._active_char_uuid)
                             self._logger.debug("Stopped notifications on %s", self._active_char_uuid)
                         except Exception as err:
-                            self._logger.debug("Could not stop notifications: %s", err)
+                            self._logger.debug(
+                                "Could not stop notifications: %s", type(err).__name__ if is_neo else err
+                            )
 
                     # Disconnect
                     await self._client.disconnect()
                     self._logger.debug("Disconnected from heater")
             except Exception as err:
-                self._logger.debug("Error during cleanup: %s", err)
+                self._logger.debug(
+                    "Error during cleanup: %s", type(err).__name__ if is_neo else err
+                )
             finally:
                 self._client = None
                 self._characteristic = None
@@ -2215,11 +2226,25 @@ class VevorHeaterCoordinator(DataUpdateCoordinator):
             char_uuid = write_char.uuid if write_char else "unknown"
             protocol_name = "Vevor/Sunster"
 
-        await self._client.write_gatt_char(write_char, packet, response=False)
-        self._logger.info(
-            "📤 Sent %d bytes to %s (char %s): %s",
-            len(packet), protocol_name, char_uuid[-4:], packet.hex()
-        )
+        # Remember the transport before awaiting: disconnect can clear it.
+        # Also protect an auth frame if transport state has already been lost.
+        is_neo = self.is_dz06_neo or packet[:3] == b"\x29\x0d\x5c"
+        try:
+            await self._client.write_gatt_char(write_char, packet, response=False)
+        except Exception as err:
+            if is_neo:
+                # Backend messages can contain the packet; HA logs this exception.
+                raise BleakError(
+                    f"DZ06 Neo GATT write failed ({type(err).__name__})"
+                ) from None
+            raise
+        if is_neo:
+            self._logger.info("Sent %d bytes to DZ06 Neo (payload omitted)", len(packet))
+        else:
+            self._logger.info(
+                "📤 Sent %d bytes to %s (char %s): %s",
+                len(packet), protocol_name, char_uuid[-4:], packet.hex()
+            )
 
     async def _send_wake_up_ping(self) -> None:
         """Send a wake-up ping to the device to ensure it's responsive."""
@@ -2344,7 +2369,7 @@ class VevorHeaterCoordinator(DataUpdateCoordinator):
         try:
             await self._write_gatt(packet)
         except Exception as err:
-            self._logger.warning("DZ06 Neo level write failed: %s", err)
+            self._logger.warning("DZ06 Neo level write failed: %s", type(err).__name__)
             return False
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
@@ -2383,7 +2408,7 @@ class VevorHeaterCoordinator(DataUpdateCoordinator):
         try:
             await self._write_gatt(self._neo_packet(0x51, run_type, target, altitude))
         except Exception as err:
-            self._logger.warning("DZ06 Neo control write failed: %s", err)
+            self._logger.warning("DZ06 Neo control write failed: %s", type(err).__name__)
             return False
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
@@ -2404,6 +2429,7 @@ class VevorHeaterCoordinator(DataUpdateCoordinator):
 
     async def _send_dz06_neo_auth(self) -> bool:
         """Read Neo configuration using its configured connection password."""
+        self._logger.info("Starting DZ06 Neo authorization")
         now = dt_util.now()
         timestamp = int(now.timestamp()) + int((now.utcoffset() or timedelta()).total_seconds())
         packet = bytearray((0x29, 0x0D, 0x5C, 0))
@@ -2411,8 +2437,10 @@ class VevorHeaterCoordinator(DataUpdateCoordinator):
         try:
             password = int(self._neo_password)
         except (TypeError, ValueError):
+            self._logger.warning("DZ06 Neo authorization skipped: invalid password configuration")
             return False
         if not 0 <= password <= 0x7FFFFFFF:
+            self._logger.warning("DZ06 Neo authorization skipped: invalid password configuration")
             return False
         packet.extend(password.to_bytes(4, "big"))
         packet.append(1)
@@ -2423,13 +2451,20 @@ class VevorHeaterCoordinator(DataUpdateCoordinator):
                 crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
         packet.extend(crc.to_bytes(2, "big"))
         self._notification_data = None
-        await self._write_gatt(packet)
+        try:
+            await self._write_gatt(packet)
+        except Exception as err:
+            self._logger.warning("DZ06 Neo authorization write failed: %s", type(err).__name__)
+            raise
         deadline = time.monotonic() + 10
+        self._logger.debug("Waiting up to 10s for DZ06 Neo authorization response")
         while time.monotonic() < deadline:
             await asyncio.sleep(0.1)
             response = self._notification_data
             if response and len(response) == 24 and response[:2] == bytearray((0x5C, 0x16)):
+                self._logger.info("DZ06 Neo authorization succeeded")
                 return True
+        self._logger.warning("DZ06 Neo authorization timed out after 10s")
         return False
 
     async def _send_command(self, command: int, argument: int, timeout: float = 5.0, max_retries: int = 1) -> bool:
@@ -2475,7 +2510,7 @@ class VevorHeaterCoordinator(DataUpdateCoordinator):
                 try:
                     await self._write_gatt(packet)
                 except Exception as err:
-                    self._logger.warning("DZ06 Neo status poll failed: %s", err)
+                    self._logger.warning("DZ06 Neo status poll failed: %s", type(err).__name__)
                     return False
                 deadline = time.monotonic() + timeout
                 while time.monotonic() < deadline:
@@ -2857,7 +2892,7 @@ class VevorHeaterCoordinator(DataUpdateCoordinator):
                 self._neo_packet(0x5A if turn_on else 0x5C, run_type, target, altitude)
             )
         except Exception as err:
-            self._logger.warning("DZ06 Neo power write failed: %s", err)
+            self._logger.warning("DZ06 Neo power write failed: %s", type(err).__name__)
             return False
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
